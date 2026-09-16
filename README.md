@@ -21,6 +21,11 @@ back. One Flutter codebase, no native plugin code.
 - **Filtering** — hex ids and ranges (`100, 200-2FF`), or DBC-known only
 - **Send** — raw frames, 11/29-bit, RTR
 - **Export** — CSV of the trace buffer, plus frames/s and bus load stats
+- **Share** — re-expose whatever adapter is connected as an SLCAN device, so
+  python-can, SavvyCAN, cangaroo or `slcand` use it alongside Pantrace:
+  `socket://127.0.0.1:20100` on every OS, plus a virtual serial port
+  (`/dev/ttys…`, shown in the status line) on macOS and Linux. Frames go both
+  ways; the bitrate stays Pantrace's.
 
 ## Install
 
@@ -70,6 +75,9 @@ the status line says what to install.
   plus known adapters by USB descriptor; Bluetooth and debug consoles are never
   probed. Toggle **All ports** for firmware that doesn't answer `V`. Bitrates
   come from the fixed S0–S8 table (10k–1M).
+- **Sharing a channel** — SocketCAN, Vector XL and PCAN (Windows/Linux) let
+  Pantrace run next to CANoe, PCAN-View etc. on the same channel; whoever
+  opened it first sets the bitrate. For everything else, see *Share* below.
 
 </details>
 

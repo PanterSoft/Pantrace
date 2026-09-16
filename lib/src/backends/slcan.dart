@@ -160,8 +160,10 @@ bool slcanLooksLikeReply(String reply) {
       ..stopBits = 1
       ..setFlowControl(SerialPortFlowControl.none);
     port.flush();
-    // 'C' first so an adapter left open by a crashed session still replies.
-    port.write(Uint8List.fromList('C\rV\r'.codeUnits), timeout: 100);
+    // No 'C' here: it would close the CAN channel of another application
+    // using the adapter. An already-open adapter answers V with BELL, which
+    // slcanLooksLikeReply accepts.
+    port.write(Uint8List.fromList('V\r'.codeUnits), timeout: 100);
     final buf = StringBuffer();
     final deadline = DateTime.now().add(const Duration(milliseconds: 300));
     while (DateTime.now().isBefore(deadline)) {

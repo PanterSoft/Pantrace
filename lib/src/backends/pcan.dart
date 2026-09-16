@@ -89,9 +89,11 @@ Map<int, String> pcanCandidateChannels() {
 // Driver bindings
 // ---------------------------------------------------------------------------
 
-const _errOk = 0x00000, _errQrcvEmpty = 0x00020;
+const _errOk = 0x00000, _errQrcvEmpty = 0x00020, _errCaution = 0x2000000;
 const _paramChannelCondition = 0x07;
-const _channelAvailable = 0x01, _channelPcanView = 0x04;
+// PCAN_CHANNEL_AVAILABLE 1, _OCCUPIED 2, _PCANVIEW 3. Occupied channels are
+// still joinable: the PCAN driver shares a channel between client applications.
+const _channelUnavailable = 0x00;
 
 typedef _InitC = Uint32 Function(Uint16, Uint16, Uint8, Uint32, Uint16);
 typedef _InitD = int Function(int, int, int, int, int);
@@ -181,7 +183,13 @@ class PcanBus implements CanBus {
       throw CanBusException('PCAN does not define a BTR pair for $bitrate bit/s');
     }
     final r = p.init(channel, baud, 0, 0, 0);
-    if (r != _errOk) throw CanBusException(_errorText(r));
+    if (r == _errCaution) {
+      // Another application already runs this channel; we join at its bitrate.
+      _status.add('channel is shared with another application — '
+          'using its bitrate instead of $bitrate bit/s');
+    } else if (r != _errOk) {
+      throw CanBusException(_errorText(r));
+    }
 
     _channel = channel;
     _msgBuf = calloc<Uint8>(pcanMsgSize);
@@ -259,7 +267,7 @@ class PcanBackend implements CanBackend {
         final r = p.getValue(entry.key, _paramChannelCondition, buf, 4);
         if (r != _errOk) continue;
         final cond = buf.asTypedList(4)[0];
-        if (cond & (_channelAvailable | _channelPcanView) != 0) {
+        if (cond != _channelUnavailable) {
           out.add(CanDevice(id, '${entry.key}', entry.value));
         }
       }

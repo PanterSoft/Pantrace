@@ -11,6 +11,7 @@ import 'src/backends/slcan.dart';
 import 'src/can.dart';
 import 'src/dbc.dart';
 import 'src/registry.dart';
+import 'src/share.dart';
 import 'src/trace.dart';
 import 'src/update.dart';
 
@@ -82,6 +83,7 @@ class TracerPage extends StatefulWidget {
 class _TracerPageState extends State<TracerPage> {
   final model = TraceModel();
   CanBus? bus;
+  CanShare? share;
   CanDevice? device;
   int bitrate = 500000;
   List<CanDevice> devices = [];
@@ -151,6 +153,7 @@ class _TracerPageState extends State<TracerPage> {
 
   @override
   void dispose() {
+    share?.stop();
     bus?.close();
     model.dispose();
     super.dispose();
@@ -193,6 +196,7 @@ class _TracerPageState extends State<TracerPage> {
   }
 
   Future<void> _disconnect() async {
+    await _setShared(false);
     await bus?.close();
     model.addStatus('disconnected');
     setState(() => bus = null);
@@ -235,6 +239,24 @@ class _TracerPageState extends State<TracerPage> {
               .map((r) => r.key));
         }
       });
+  Future<void> _setShared(bool on) async {
+    await share?.stop();
+    share = null;
+    final b = bus;
+    if (on && b != null) {
+      final s = CanShare(b,
+          onClientSent: model.add, busEchoes: device?.backend == 'virtual');
+      try {
+        final endpoints = await s.start();
+        share = s;
+        model.addStatus('sharing bus as SLCAN on ${endpoints.join(' and ')}');
+      } catch (e) {
+        _toast('Could not share the bus: $e');
+      }
+    }
+    if (mounted) setState(() {});
+  }
+
   void setDevice(CanDevice? d) => setState(() => device = d);
   void setBitrate(int b) => setState(() => bitrate = b);
   void setProbeSerial(bool v) {
@@ -432,6 +454,13 @@ class _Toolbar extends StatelessWidget {
               icon: Icon(connected ? Icons.stop : Icons.play_arrow),
               label: Text(connected ? 'Disconnect' : 'Connect'),
             ),
+          ),
+          FilterChip(
+            tooltip: 'Let other tools use this bus as an SLCAN device '
+                '(TCP on localhost, plus a virtual serial port on macOS/Linux)',
+            label: const Text('Share'),
+            selected: state.share != null,
+            onSelected: connected ? state._setShared : null,
           ),
           const SizedBox(width: 12),
           SegmentedButton<TraceView>(
@@ -921,7 +950,10 @@ class _SendDialogState extends State<_SendDialog> {
           direction: FrameDirection.tx);
       await widget.state.bus!.send(frame);
       // Drivers that do not echo transmissions still need the frame traced.
-      if (widget.state.device?.backend != 'virtual') widget.state.model.add(frame);
+      if (widget.state.device?.backend != 'virtual') {
+        widget.state.model.add(frame);
+        widget.state.share?.relay(frame);
+      }
       if (mounted) Navigator.pop(context);
     } catch (e) {
       setState(() => error = '$e');
