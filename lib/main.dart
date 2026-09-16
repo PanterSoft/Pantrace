@@ -182,7 +182,11 @@ class _TracerPageState extends State<TracerPage> {
     try {
       final b = backendById(d.backend).create();
       b.frames.listen(model.add);
-      b.status.listen(model.addStatus);
+      b.status.listen((s) {
+        model.addStatus(s);
+        // The backend closes itself when the device goes away.
+        if (!b.isOpen && bus == b && mounted) setState(() => bus = null);
+      });
       await b.open(d.address, bitrate);
       model.bitrate = bitrate;
       model.addStatus('connected to ${d.label} at $bitrate bit/s');

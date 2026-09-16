@@ -255,9 +255,13 @@ class SlcanBus implements CanBus {
     _write('O\r');
 
     _sub = SerialPortReader(port).stream.listen(
-          _onData,
-          onError: (Object e) => _status.add('serial error: $e'),
-        );
+      _onData,
+      onError: (Object e) {
+        // Usually the adapter was unplugged; the port is dead from here on.
+        _status.add('serial error: $e');
+        close();
+      },
+    );
   }
 
   void _onData(Uint8List chunk) {
@@ -275,7 +279,13 @@ class SlcanBus implements CanBus {
     }
   }
 
-  void _write(String s) => _port?.write(Uint8List.fromList(s.codeUnits));
+  void _write(String s) {
+    try {
+      _port?.write(Uint8List.fromList(s.codeUnits));
+    } on SerialPortError catch (e) {
+      _status.add('serial error: $e');
+    }
+  }
 
   @override
   Future<void> send(CanFrame frame) async {
@@ -285,12 +295,21 @@ class SlcanBus implements CanBus {
 
   @override
   Future<void> close() async {
+    final port = _port;
+    if (port == null) return;
+    _port = null;
     _write('C\r');
     await _sub?.cancel();
     _sub = null;
-    _port?.close();
-    _port?.dispose();
-    _port = null;
+    // macOS blocks forever in close() on a yanked USB serial device, so close
+    // off the UI isolate and give up after a while (the fd leaks, the OS
+    // reclaims it on exit).
+    final addr = port.address;
+    await Isolate.run(() {
+      final p = SerialPort.fromAddress(addr);
+      p.close();
+      p.dispose();
+    }).timeout(const Duration(seconds: 2), onTimeout: () {});
   }
 }
 
