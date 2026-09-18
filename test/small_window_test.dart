@@ -21,10 +21,12 @@ void main() {
       // Controls that must remain reachable without a maximised window.
       for (final label in ['Connect', 'Load DBC', 'Export CSV']) {
         final finder = find.text(label);
-        expect(finder, findsOneWidget, reason: '$label missing at $size');
-        final rect = tester.getRect(finder);
-        expect(rect.right, lessThanOrEqualTo(size.width),
-            reason: '$label clipped at $size');
+        expect(finder, findsWidgets, reason: '$label missing at $size');
+        for (final e in finder.evaluate()) {
+          final rect = tester.getRect(find.byWidget(e.widget));
+          expect(rect.right, lessThanOrEqualTo(size.width),
+              reason: '$label clipped at $size');
+        }
       }
 
       // Connecting swaps labels and icons; none of that may move the toolbar,
@@ -36,7 +38,7 @@ void main() {
       final layout = geometry();
 
       // The trace table degrades to a sideways scroll rather than crushed columns.
-      await tester.tap(find.text('Connect'));
+      await tester.tap(find.text('Connect').first);
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
       expect(geometry(), layout, reason: 'toolbar shifted on connect at $size');

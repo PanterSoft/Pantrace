@@ -14,6 +14,7 @@ import 'dbc.dart';
 class TraceRow {
   final int id;
   final bool extended;
+  final int channel;
   int count = 0;
   Uint8List data;
   FrameDirection direction;
@@ -23,7 +24,8 @@ class TraceRow {
   /// Bytes that differed between the last two frames — drives change highlighting.
   int changedMask = 0;
 
-  TraceRow(this.id, this.extended, this.data, this.lastSeen, this.direction);
+  TraceRow(this.id, this.extended, this.channel, this.data, this.lastSeen,
+      this.direction);
 
   /// Mean interval over the last two occurrences, in milliseconds.
   double? get periodMs {
@@ -32,12 +34,23 @@ class TraceRow {
     return lastSeen.difference(p).inMicroseconds / 1000.0;
   }
 
-  int get key => DbcDatabase.key(id, extended);
+  /// Unique per (channel, id, extended); the same id on two buses is two rows.
+  int get key => rowKey(channel, id, extended);
+
+  static int rowKey(int channel, int id, bool extended) =>
+      (channel << 32) | DbcDatabase.key(id, extended);
 }
 
 enum TraceView { live, grouped }
 
+/// Sortable columns of the grouped view.
+enum TraceSort { channel, id, name, length, data, count, cycle }
+
 class TraceModel extends ChangeNotifier {
+  /// ponytail: two buses is what a gateway needs; the model is index-based so
+  /// raising this is a constant, the toolbar is the part that would need work.
+  static const channels = 2;
+
   /// ponytail: fixed-size ring of the most recent frames. A tracer that keeps
   /// every frame forever eventually eats all RAM; raise the cap or spill to
   /// disk if you need a long capture.
@@ -53,16 +66,20 @@ class TraceModel extends ChangeNotifier {
   bool paused = false;
   TraceView view = TraceView.grouped;
 
+  TraceSort sort = TraceSort.id;
+  bool sortAscending = true;
+
   // Filters
   String idFilter = '';
 
   // Statistics
   int totalFrames = 0;
+  int errorFrames = 0;
   int _framesSinceTick = 0;
   double framesPerSecond = 0;
-  int _bitsSinceTick = 0;
-  double busLoadPercent = 0;
-  int bitrate = 500000;
+  final _bitsSinceTick = List<int>.filled(channels, 0);
+  final busLoadPercent = List<double>.filled(channels, 0);
+  final bitrates = List<int>.filled(channels, 500000);
   final List<String> statusLog = [];
 
   TraceModel() {
@@ -71,10 +88,13 @@ class TraceModel extends ChangeNotifier {
 
   void _tick(Timer _) {
     framesPerSecond = _framesSinceTick * 20.0;
-    busLoadPercent =
-        bitrate == 0 ? 0 : (_bitsSinceTick * 20.0 / bitrate * 100).clamp(0, 100);
+    for (var c = 0; c < channels; c++) {
+      final br = bitrates[c];
+      busLoadPercent[c] =
+          br == 0 ? 0 : (_bitsSinceTick[c] * 20.0 / br * 100).clamp(0, 100);
+      _bitsSinceTick[c] = 0;
+    }
     _framesSinceTick = 0;
-    _bitsSinceTick = 0;
     notifyListeners();
   }
 
@@ -84,9 +104,19 @@ class TraceModel extends ChangeNotifier {
       (f.extended ? 67 : 47) + 8 * f.data.length;
 
   void add(CanFrame frame) {
+    // Error frames carry no payload, so they are counted on their own and kept
+    // out of the rate and bus-load figures and out of the grouped view.
+    if (frame.isError) {
+      errorFrames++;
+      if (!paused) {
+        _live.add(frame);
+        if (_live.length > liveCapacity) _live.removeAt(0);
+      }
+      return;
+    }
     totalFrames++;
     _framesSinceTick++;
-    _bitsSinceTick += frameBits(frame);
+    _bitsSinceTick[frame.channel] += frameBits(frame);
     if (paused) return;
 
     _live.add(frame);
@@ -94,11 +124,11 @@ class TraceModel extends ChangeNotifier {
       _live.removeRange(0, _live.length - liveCapacity);
     }
 
-    final key = DbcDatabase.key(frame.id, frame.extended);
+    final key = TraceRow.rowKey(frame.channel, frame.id, frame.extended);
     final existing = _rows[key];
     if (existing == null) {
-      _rows[key] = TraceRow(
-          frame.id, frame.extended, frame.data, frame.timestamp, frame.direction)
+      _rows[key] = TraceRow(frame.id, frame.extended, frame.channel, frame.data,
+          frame.timestamp, frame.direction)
         ..count = 1;
     } else {
       var mask = 0;
@@ -127,6 +157,7 @@ class TraceModel extends ChangeNotifier {
     _live.clear();
     _rows.clear();
     totalFrames = 0;
+    errorFrames = 0;
     notifyListeners();
   }
 
@@ -137,6 +168,18 @@ class TraceModel extends ChangeNotifier {
 
   void setView(TraceView v) {
     view = v;
+    notifyListeners();
+  }
+
+  /// Clicking the same header again flips the direction; a new one starts
+  /// ascending.
+  void setSort(TraceSort column) {
+    if (sort == column) {
+      sortAscending = !sortAscending;
+    } else {
+      sort = column;
+      sortAscending = true;
+    }
     notifyListeners();
   }
 
@@ -178,6 +221,8 @@ class TraceModel extends ChangeNotifier {
     return false;
   }
 
+  /// Error frames have no id to filter on, and hiding them behind an id filter
+  /// would hide exactly what the filter is usually being used to chase.
   bool _passes(int id, bool extended) => matchesIdFilter(id, idFilter);
 
   /// Newest first, so the interesting end is at the top and no scroll
@@ -186,25 +231,71 @@ class TraceModel extends ChangeNotifier {
     final out = <CanFrame>[];
     for (var i = _live.length - 1; i >= 0; i--) {
       final f = _live[i];
-      if (_passes(f.id, f.extended)) out.add(f);
+      if (f.isError || _passes(f.id, f.extended)) out.add(f);
     }
     return out;
   }
 
+  static int _byId(TraceRow a, TraceRow b) {
+    if (a.extended != b.extended) return a.extended ? 1 : -1;
+    return a.id.compareTo(b.id);
+  }
+
+  /// Unsigned lexicographic compare of the payloads, shorter first on a tie.
+  static int _byData(TraceRow a, TraceRow b) {
+    final n = a.data.length < b.data.length ? a.data.length : b.data.length;
+    for (var i = 0; i < n; i++) {
+      final c = a.data[i].compareTo(b.data[i]);
+      if (c != 0) return c;
+    }
+    return a.data.length.compareTo(b.data.length);
+  }
+
+  /// Rows without a cycle time yet sort last in both directions — they carry
+  /// no information to order by.
+  static int _byCycle(TraceRow a, TraceRow b, bool ascending) {
+    final x = a.periodMs, y = b.periodMs;
+    if (x == null || y == null) {
+      if (x == y) return 0;
+      return (x == null ? 1 : -1) * (ascending ? 1 : -1);
+    }
+    return x.compareTo(y);
+  }
+
   List<TraceRow> get groupedRows {
     final out = _rows.values.where((r) => _passes(r.id, r.extended)).toList();
+    final sign = sortAscending ? 1 : -1;
     out.sort((a, b) {
-      if (a.extended != b.extended) return a.extended ? 1 : -1;
-      return a.id.compareTo(b.id);
+      final c = switch (sort) {
+        TraceSort.channel => a.channel.compareTo(b.channel),
+        TraceSort.id => _byId(a, b),
+        TraceSort.name => (messageFor(a.id, a.extended)?.name ?? '')
+            .compareTo(messageFor(b.id, b.extended)?.name ?? ''),
+        TraceSort.length => a.data.length.compareTo(b.data.length),
+        TraceSort.data => _byData(a, b),
+        TraceSort.count => a.count.compareTo(b.count),
+        TraceSort.cycle => _byCycle(a, b, sortAscending),
+      };
+      // Ties keep a stable, predictable order instead of hash order; the same
+      // id on both buses ends up adjacent, which is what a gateway check wants.
+      if (c != 0) return sign * c;
+      final byId = _byId(a, b);
+      return byId != 0 ? byId : a.channel.compareTo(b.channel);
     });
     return out;
   }
 
   /// CSV of the live buffer, in chronological order.
   String toCsv() {
-    final b = StringBuffer('timestamp,direction,id,extended,dlc,data\n');
+    final b = StringBuffer('timestamp,channel,direction,id,extended,dlc,data\n');
     for (final f in _live) {
+      if (f.isError) {
+        b.writeln('${f.timestamp.toIso8601String()},${f.channel + 1},'
+            'error,,,,"${f.error}"');
+        continue;
+      }
       b.writeln('${f.timestamp.toIso8601String()},'
+          '${f.channel + 1},'
           '${f.direction.name},'
           '${f.idHex},'
           '${f.extended},'

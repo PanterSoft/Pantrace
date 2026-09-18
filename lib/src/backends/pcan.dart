@@ -214,6 +214,10 @@ class PcanBus implements CanBus {
       final frame = decodePcanMsg(raw, timestamp: ts);
       if (frame != null) {
         _frames.add(frame);
+      } else if (raw[4] & _msgErrFrame != 0) {
+        const what = 'error frame on bus';
+        _status.add(what);
+        _frames.add(CanFrame.error(what));
       } else if (raw[4] & _msgStatus != 0) {
         _status.add('bus status change reported by adapter');
       }

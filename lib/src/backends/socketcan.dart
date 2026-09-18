@@ -173,7 +173,9 @@ class SocketCanBus implements CanBus {
       if (frame != null) {
         _frames.add(frame);
       } else {
-        _status.add(describeErrorFrame(raw));
+        final what = describeErrorFrame(raw);
+        _status.add(what);
+        _frames.add(CanFrame.error(what));
       }
     }
   }

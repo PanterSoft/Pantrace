@@ -24,7 +24,11 @@ const _extMsgId = 0x80000000;
 class XlDecoded {
   final CanFrame? frame;
   final String? status;
-  const XlDecoded({this.frame, this.status});
+
+  /// True when [status] describes a bus error rather than a plain notice —
+  /// those also surface as error frames in the trace.
+  final bool isError;
+  const XlDecoded({this.frame, this.status, this.isError = false});
 }
 
 XlDecoded decodeXlEvent(Uint8List raw) {
@@ -42,10 +46,11 @@ XlDecoded decodeXlEvent(Uint8List raw) {
   final dlc = bd.getUint16(22, Endian.little).clamp(0, 8);
 
   if (flags & _flagErrorFrame != 0) {
-    return const XlDecoded(status: 'error frame on bus');
+    return const XlDecoded(status: 'error frame on bus', isError: true);
   }
   if (flags & _flagOverrun != 0) {
-    return const XlDecoded(status: 'receive queue overrun — frames were lost');
+    return const XlDecoded(
+        status: 'receive queue overrun — frames were lost', isError: true);
   }
 
   final extended = rawId & _extMsgId != 0;
@@ -234,7 +239,10 @@ class VectorBus implements CanBus {
       final decoded =
           decodeXlEvent(Uint8List.fromList(_evBuf.asTypedList(xlEventSize)));
       if (decoded.frame != null) _frames.add(decoded.frame!);
-      if (decoded.status != null) _status.add(decoded.status!);
+      if (decoded.status != null) {
+        _status.add(decoded.status!);
+        if (decoded.isError) _frames.add(CanFrame.error(decoded.status!));
+      }
     }
   }
 

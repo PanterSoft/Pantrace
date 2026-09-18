@@ -80,14 +80,20 @@ class TracerPage extends StatefulWidget {
   State<TracerPage> createState() => _TracerPageState();
 }
 
-class _TracerPageState extends State<TracerPage> {
-  final model = TraceModel();
+/// Everything that exists once per traced bus.
+class _Channel {
   CanBus? bus;
   CanShare? share;
   CanDevice? device;
   int bitrate = 500000;
-  List<CanDevice> devices = [];
   bool connecting = false;
+  bool get connected => bus != null;
+}
+
+class _TracerPageState extends State<TracerPage> {
+  final model = TraceModel();
+  final channels = List.generate(TraceModel.channels, (_) => _Channel());
+  List<CanDevice> devices = [];
   bool scanning = false;
   final expanded = <int>{};
 
@@ -151,10 +157,14 @@ class _TracerPageState extends State<TracerPage> {
   void _snack(String msg) =>
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
 
+  bool get anyConnected => channels.any((c) => c.connected);
+
   @override
   void dispose() {
-    share?.stop();
-    bus?.close();
+    for (final c in channels) {
+      c.share?.stop();
+      c.bus?.close();
+    }
     model.dispose();
     super.dispose();
   }
@@ -170,40 +180,51 @@ class _TracerPageState extends State<TracerPage> {
     setState(() {
       scanning = false;
       devices = found;
-      if (device != null && !found.contains(device)) device = null;
-      device ??= found.isNotEmpty ? found.first : null;
+      for (final (i, c) in channels.indexed) {
+        if (c.device != null && !found.contains(c.device)) c.device = null;
+        // CAN1 defaults to the first interface, CAN2 to the second if any.
+        c.device ??= i < found.length ? found[i] : null;
+      }
     });
   }
 
-  Future<void> _connect() async {
-    final d = device;
+  Future<void> _connect(int ch) async {
+    final c = channels[ch];
+    final d = c.device;
     if (d == null) return;
-    setState(() => connecting = true);
+    // One physical interface cannot be two buses; the virtual one can.
+    if (d.backend != 'virtual' &&
+        channels.any((o) => o != c && o.connected && o.device == d)) {
+      _toast('${d.label} is already in use by another channel');
+      return;
+    }
+    setState(() => c.connecting = true);
     try {
       final b = backendById(d.backend).create();
-      b.frames.listen(model.add);
+      b.frames.listen((f) => model.add(f.withChannel(ch)));
       b.status.listen((s) {
-        model.addStatus(s);
+        model.addStatus('CAN${ch + 1}: $s');
         // The backend closes itself when the device goes away.
-        if (!b.isOpen && bus == b && mounted) setState(() => bus = null);
+        if (!b.isOpen && c.bus == b && mounted) setState(() => c.bus = null);
       });
-      await b.open(d.address, bitrate);
-      model.bitrate = bitrate;
-      model.addStatus('connected to ${d.label} at $bitrate bit/s');
-      setState(() => bus = b);
+      await b.open(d.address, c.bitrate);
+      model.bitrates[ch] = c.bitrate;
+      model.addStatus('CAN${ch + 1}: connected to ${d.label} at ${c.bitrate} bit/s');
+      setState(() => c.bus = b);
     } catch (e) {
-      model.addStatus('$e');
+      model.addStatus('CAN${ch + 1}: $e');
       if (mounted) _toast('$e');
     } finally {
-      if (mounted) setState(() => connecting = false);
+      if (mounted) setState(() => c.connecting = false);
     }
   }
 
-  Future<void> _disconnect() async {
-    await _setShared(false);
-    await bus?.close();
-    model.addStatus('disconnected');
-    setState(() => bus = null);
+  Future<void> _disconnect(int ch) async {
+    final c = channels[ch];
+    await _setShared(ch, false);
+    await c.bus?.close();
+    model.addStatus('CAN${ch + 1}: disconnected');
+    setState(() => c.bus = null);
   }
 
   Future<void> _loadDbc() async {
@@ -243,17 +264,20 @@ class _TracerPageState extends State<TracerPage> {
               .map((r) => r.key));
         }
       });
-  Future<void> _setShared(bool on) async {
-    await share?.stop();
-    share = null;
-    final b = bus;
+  Future<void> _setShared(int ch, bool on) async {
+    final c = channels[ch];
+    await c.share?.stop();
+    c.share = null;
+    final b = c.bus;
     if (on && b != null) {
       final s = CanShare(b,
-          onClientSent: model.add, busEchoes: device?.backend == 'virtual');
+          onClientSent: (f) => model.add(f.withChannel(ch)),
+          busEchoes: c.device?.backend == 'virtual');
       try {
         final endpoints = await s.start();
-        share = s;
-        model.addStatus('sharing bus as SLCAN on ${endpoints.join(' and ')}');
+        c.share = s;
+        model.addStatus(
+            'CAN${ch + 1}: sharing bus as SLCAN on ${endpoints.join(' and ')}');
       } catch (e) {
         _toast('Could not share the bus: $e');
       }
@@ -261,8 +285,8 @@ class _TracerPageState extends State<TracerPage> {
     if (mounted) setState(() {});
   }
 
-  void setDevice(CanDevice? d) => setState(() => device = d);
-  void setBitrate(int b) => setState(() => bitrate = b);
+  void setDevice(int ch, CanDevice? d) => setState(() => channels[ch].device = d);
+  void setBitrate(int ch, int b) => setState(() => channels[ch].bitrate = b);
   void setProbeSerial(bool v) {
     (backendById('slcan') as SlcanBackend).probe = v;
     _refreshDevices();
@@ -378,9 +402,76 @@ class _Toolbar extends StatelessWidget {
   final _TracerPageState state;
   const _Toolbar({required this.state});
 
+  /// Interface, bitrate, connect and share for one bus. Flat children rather
+  /// than a nested Row so the outer Wrap can break between them on a narrow
+  /// window.
+  List<Widget> _channel(int ch, double Function(double) cap) {
+    final c = state.channels[ch];
+    final connected = c.connected;
+    return [
+      Text('CAN${ch + 1}',
+          style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: connected ? const Color(0xFF3DDC84) : Colors.grey)),
+      SizedBox(
+        width: cap(260),
+        child: DropdownButtonFormField<CanDevice>(
+          key: ValueKey('device$ch'),
+          initialValue: c.device,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              labelText: 'Interface', border: OutlineInputBorder(), isDense: true),
+          items: state.devices
+              .map((d) => DropdownMenuItem(
+                  value: d,
+                  child: Text(d.label, overflow: TextOverflow.ellipsis)))
+              .toList(),
+          onChanged: connected ? null : (d) => state.setDevice(ch, d),
+        ),
+      ),
+      SizedBox(
+        width: cap(130),
+        child: DropdownButtonFormField<int>(
+          key: ValueKey('bitrate$ch'),
+          initialValue: c.bitrate,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              labelText: 'Bitrate', border: OutlineInputBorder(), isDense: true),
+          items: kStandardBitrates
+              .map((b) => DropdownMenuItem(
+                  value: b,
+                  child: Text('${b ~/ 1000} kbit/s', overflow: TextOverflow.ellipsis)))
+              .toList(),
+          onChanged: connected ? null : (b) => state.setBitrate(ch, b!),
+        ),
+      ),
+      // Fixed width: 'Disconnect' is wider than 'Connect', and letting the
+      // button resize re-wraps the whole toolbar on every connect.
+      SizedBox(
+        width: 150,
+        child: FilledButton.icon(
+          onPressed: c.connecting || (!connected && c.device == null)
+              ? null
+              : connected
+                  ? () => state._disconnect(ch)
+                  : () => state._connect(ch),
+          icon: Icon(connected ? Icons.stop : Icons.play_arrow),
+          label: Text(connected ? 'Disconnect' : 'Connect'),
+        ),
+      ),
+      FilterChip(
+        tooltip: 'Let other tools use this bus as an SLCAN device '
+            '(TCP on localhost, plus a virtual serial port on macOS/Linux)',
+        label: const Text('Share'),
+        selected: c.share != null,
+        onSelected: connected ? (v) => state._setShared(ch, v) : null,
+      ),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
-    final connected = state.bus != null;
+    final connected = state.anyConnected;
     return LayoutBuilder(builder: (context, c) {
     // Fields keep their preferred width until the window is narrower than they are.
     double cap(double want) => math.min(want, c.maxWidth - 24);
@@ -394,24 +485,7 @@ class _Toolbar extends StatelessWidget {
           const Text('Pantrace',
               style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
           const SizedBox(width: 8),
-          SizedBox(
-            width: cap(300),
-            child: DropdownButtonFormField<CanDevice>(
-              initialValue: state.device,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                  labelText: 'Interface',
-                  border: OutlineInputBorder(),
-                  isDense: true),
-              items: state.devices
-                  .map((d) => DropdownMenuItem(
-                      value: d,
-                      child: Text(d.label, overflow: TextOverflow.ellipsis)))
-                  .toList(),
-              onChanged:
-                  connected ? null : state.setDevice,
-            ),
-          ),
+          for (var ch = 0; ch < state.channels.length; ch++) ..._channel(ch, cap),
           IconButton(
             tooltip: 'Rescan for devices',
             onPressed: connected || state.scanning ? null : state._refreshDevices,
@@ -428,43 +502,6 @@ class _Toolbar extends StatelessWidget {
             label: const Text('All ports'),
             selected: !(backendById('slcan') as SlcanBackend).probe,
             onSelected: connected ? null : (v) => state.setProbeSerial(!v),
-          ),
-          SizedBox(
-            width: cap(150),
-            child: DropdownButtonFormField<int>(
-              initialValue: state.bitrate,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                  labelText: 'Bitrate',
-                  border: OutlineInputBorder(),
-                  isDense: true),
-              items: kStandardBitrates
-                  .map((b) => DropdownMenuItem(
-                      value: b, child: Text('${b ~/ 1000} kbit/s', overflow: TextOverflow.ellipsis)))
-                  .toList(),
-              onChanged: connected ? null : (b) => state.setBitrate(b!),
-            ),
-          ),
-          // Fixed width: 'Disconnect' is wider than 'Connect', and letting the
-          // button resize re-wraps the whole toolbar on every connect.
-          SizedBox(
-            width: 150,
-            child: FilledButton.icon(
-              onPressed: state.connecting
-                  ? null
-                  : connected
-                      ? state._disconnect
-                      : state._connect,
-              icon: Icon(connected ? Icons.stop : Icons.play_arrow),
-              label: Text(connected ? 'Disconnect' : 'Connect'),
-            ),
-          ),
-          FilterChip(
-            tooltip: 'Let other tools use this bus as an SLCAN device '
-                '(TCP on localhost, plus a virtual serial port on macOS/Linux)',
-            label: const Text('Share'),
-            selected: state.share != null,
-            onSelected: connected ? state._setShared : null,
           ),
           const SizedBox(width: 12),
           SegmentedButton<TraceView>(
@@ -565,7 +602,7 @@ class _Toolbar extends StatelessWidget {
 
 /// Narrower than this the columns stop being readable, so the whole table
 /// scrolls sideways instead of crushing every cell into an ellipsis.
-const _minTableWidth = 820.0;
+const _minTableWidth = 880.0;
 
 Widget _scrollableTable(Widget table) => LayoutBuilder(
       builder: (context, c) => c.maxWidth >= _minTableWidth
@@ -590,6 +627,31 @@ Widget _header(List<(String, int)> cols) => Container(
         ],
       ),
     );
+
+/// Clickable column header of the grouped table: picks the sort column, and
+/// clicking the active one flips the direction.
+Widget _sortHeader(TraceModel model, String label, int flex, TraceSort column) {
+  final active = model.sort == column;
+  return Expanded(
+    flex: flex,
+    child: InkWell(
+      onTap: () => model.setSort(column),
+      child: Row(
+        children: [
+          Flexible(
+              child: Text(label,
+                  overflow: TextOverflow.ellipsis,
+                  style: active
+                      ? _headerStyle.copyWith(color: const Color(0xFFE0E0E0))
+                      : _headerStyle)),
+          if (active)
+            Icon(model.sortAscending ? Icons.arrow_upward : Icons.arrow_downward,
+                size: 12, color: const Color(0xFFE0E0E0)),
+        ],
+      ),
+    ),
+  );
+}
 
 /// Hex payload with per-byte highlighting of what just changed.
 class _HexData extends StatelessWidget {
@@ -668,12 +730,13 @@ class _GroupedTable extends StatelessWidget {
                 onPressed: model.dbc == null ? null : () => state.expandAll(!anyExpanded),
                 icon: Icon(anyExpanded ? Icons.unfold_less : Icons.unfold_more),
               ),
-              const Expanded(flex: 2, child: Text('ID', style: _headerStyle)),
-              const Expanded(flex: 4, child: Text('MESSAGE / SIGNAL', style: _headerStyle)),
-              const Expanded(flex: 1, child: Text('LEN', style: _headerStyle)),
-              const Expanded(flex: 6, child: Text('DATA / VALUE', style: _headerStyle)),
-              const Expanded(flex: 2, child: Text('COUNT / RAW', style: _headerStyle)),
-              const Expanded(flex: 2, child: Text('CYCLE', style: _headerStyle)),
+              _sortHeader(model, 'CH', 1, TraceSort.channel),
+              _sortHeader(model, 'ID', 2, TraceSort.id),
+              _sortHeader(model, 'MESSAGE / SIGNAL', 4, TraceSort.name),
+              _sortHeader(model, 'LEN', 1, TraceSort.length),
+              _sortHeader(model, 'DATA / VALUE', 6, TraceSort.data),
+              _sortHeader(model, 'COUNT / RAW', 2, TraceSort.count),
+              _sortHeader(model, 'CYCLE', 2, TraceSort.cycle),
             ],
           ),
         ),
@@ -713,6 +776,7 @@ class _GroupedTable extends StatelessWidget {
                   : Icon(open ? Icons.arrow_drop_down : Icons.arrow_right,
                       size: 20, color: theme.colorScheme.primary),
             ),
+            Expanded(flex: 1, child: Text('${r.channel + 1}', style: _mono)),
             Expanded(
                 flex: 2,
                 child: Text('${r.extended ? "x" : ""}${_hexId(r.id, r.extended)}',
@@ -745,7 +809,7 @@ class _GroupedTable extends StatelessWidget {
       child: Row(
         children: [
           const SizedBox(width: 40),
-          const Expanded(flex: 2, child: SizedBox()),
+          const Expanded(flex: 3, child: SizedBox()),
           Expanded(
               flex: 4,
               child: Padding(
@@ -774,6 +838,32 @@ class _GroupedTable extends StatelessWidget {
   }
 }
 
+/// An error frame: no id or payload to show, so the description takes over the
+/// row and the red makes it findable while scrolling past traffic.
+Widget _errorRow(CanFrame f) => Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
+        children: [
+          Expanded(
+              flex: 3,
+              child: Text(f.timestamp.toIso8601String().substring(11, 23),
+                  style: _mono.copyWith(color: Colors.redAccent))),
+          Expanded(
+              flex: 1,
+              child: Text('${f.channel + 1}',
+                  style: _mono.copyWith(color: Colors.redAccent))),
+          const Expanded(
+              flex: 1,
+              child: Icon(Icons.error_outline, size: 14, color: Colors.redAccent)),
+          Expanded(
+              flex: 13,
+              child: Text('ERROR FRAME — ${f.error}',
+                  overflow: TextOverflow.ellipsis,
+                  style: _mono.copyWith(color: Colors.redAccent))),
+        ],
+      ),
+    );
+
 class _LiveTable extends StatelessWidget {
   final _TracerPageState state;
   const _LiveTable({required this.state});
@@ -784,7 +874,8 @@ class _LiveTable extends StatelessWidget {
     return _scrollableTable(Column(
       children: [
         _header(const [
-          ('TIME', 3), ('DIR', 1), ('ID', 2), ('MESSAGE', 4), ('LEN', 1), ('DATA', 6),
+          ('TIME', 3), ('CH', 1), ('DIR', 1), ('ID', 2), ('MESSAGE', 4), ('LEN', 1),
+          ('DATA', 6),
         ]),
         Expanded(
           child: frames.isEmpty
@@ -794,6 +885,7 @@ class _LiveTable extends StatelessWidget {
                   itemExtent: 26,
                   itemBuilder: (context, i) {
                     final f = frames[i];
+                    if (f.isError) return _errorRow(f);
                     final msg = state.model.messageFor(f.id, f.extended);
                     final tx = f.direction == FrameDirection.tx;
                     return InkWell(
@@ -809,6 +901,9 @@ class _LiveTable extends StatelessWidget {
                                         .toIso8601String()
                                         .substring(11, 23),
                                     style: _mono.copyWith(color: Colors.grey))),
+                            Expanded(
+                                flex: 1,
+                                child: Text('${f.channel + 1}', style: _mono)),
                             Expanded(
                                 flex: 1,
                                 child: Text(tx ? 'Tx' : 'Rx',
@@ -881,8 +976,12 @@ class _StatusBar extends StatelessWidget {
               child: Row(children: [
                 _stat('Frames', '${model.totalFrames}'),
                 _stat('Rate', '${model.framesPerSecond.round()} /s'),
-                _stat('Bus load', '${model.busLoadPercent.toStringAsFixed(1)} %'),
+                for (var ch = 0; ch < TraceModel.channels; ch++)
+                  _stat('Load ${ch + 1}',
+                      '${model.busLoadPercent[ch].toStringAsFixed(1)} %'),
                 _stat('IDs', '${model.groupedRows.length}'),
+                _stat('Errors', '${model.errorFrames}',
+                    color: model.errorFrames > 0 ? Colors.redAccent : null),
                 if (model.dbcPath != null) _stat('DBC', model.dbcPath!),
                 if (model.paused)
                   const Padding(
@@ -907,12 +1006,14 @@ class _StatusBar extends StatelessWidget {
     );
   }
 
-  Widget _stat(String label, String value) => Padding(
+  Widget _stat(String label, String value, {Color? color}) => Padding(
         padding: const EdgeInsets.only(right: 20),
         child: Row(mainAxisSize: MainAxisSize.min, children: [
           Text('$label ',
-              style: const TextStyle(fontSize: 11, color: Colors.grey)),
-          Text(value, softWrap: false, style: _mono.copyWith(fontSize: 12)),
+              style: TextStyle(fontSize: 11, color: color ?? Colors.grey)),
+          Text(value,
+              softWrap: false,
+              style: _mono.copyWith(fontSize: 12, color: color)),
         ]),
       );
 }
@@ -927,6 +1028,8 @@ class _SendDialog extends StatefulWidget {
 }
 
 class _SendDialogState extends State<_SendDialog> {
+  late int channel =
+      widget.state.channels.indexWhere((c) => c.connected).clamp(0, 99);
   final idCtrl = TextEditingController(text: '123');
   final dataCtrl = TextEditingController(text: '00 11 22 33');
   bool extended = false;
@@ -952,11 +1055,12 @@ class _SendDialogState extends State<_SendDialog> {
       final frame = CanFrame(
           id: id, data: data, extended: extended, rtr: rtr,
           direction: FrameDirection.tx);
-      await widget.state.bus!.send(frame);
+      final c = widget.state.channels[channel];
+      await c.bus!.send(frame);
       // Drivers that do not echo transmissions still need the frame traced.
-      if (widget.state.device?.backend != 'virtual') {
-        widget.state.model.add(frame);
-        widget.state.share?.relay(frame);
+      if (c.device?.backend != 'virtual') {
+        widget.state.model.add(frame.withChannel(channel));
+        c.share?.relay(frame);
       }
       if (mounted) Navigator.pop(context);
     } catch (e) {
@@ -973,6 +1077,16 @@ class _SendDialogState extends State<_SendDialog> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            SegmentedButton<int>(
+              segments: [
+                for (final (i, c) in widget.state.channels.indexed)
+                  ButtonSegment(
+                      value: i, enabled: c.connected, label: Text('CAN${i + 1}')),
+              ],
+              selected: {channel},
+              onSelectionChanged: (s) => setState(() => channel = s.first),
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: idCtrl,
               style: _mono,
