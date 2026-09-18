@@ -310,11 +310,22 @@ void main() {
 
     test('demo mode produces traffic', () async {
       final bus = VirtualBus();
+      expect(bus.isOpen, isFalse);
       await bus.open('demo', 500000);
+      expect(bus.isOpen, isTrue);
       final frames = await bus.frames.take(5).toList();
       expect(frames.length, 5);
       expect(frames.every((f) => f.data.isNotEmpty), isTrue);
       await bus.close();
+      expect(bus.isOpen, isFalse);
+    });
+
+    test('backend advertises itself as always available', () {
+      final b = VirtualBackend();
+      expect(b.name, contains('Virtual'));
+      expect(b.available, isTrue);
+      expect(b.unavailableReason, isEmpty);
+      expect(b.create(), isA<VirtualBus>());
     });
   });
 }

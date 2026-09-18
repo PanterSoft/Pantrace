@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 
 import '../can.dart';
@@ -264,8 +265,23 @@ class SlcanBus implements CanBus {
     );
   }
 
+  /// Longest legit line is a timestamped 29-bit/8-byte frame (30 chars);
+  /// leave headroom. Guards against a buffer that grows without bound if a
+  /// noisy line (or a misidentified device) never sends the \r terminator.
+  static const _maxLineLength = 256;
+
+  /// Feeds bytes through the exact path a real read would. Tests only — it
+  /// lets the receive-buffer bound be exercised without a live serial port.
+  @visibleForTesting
+  void feedForTest(Uint8List chunk) => _onData(chunk);
+
   void _onData(Uint8List chunk) {
     _buffer += String.fromCharCodes(chunk);
+    if (_buffer.length > _maxLineLength) {
+      _status.add('discarding $_maxLineLength+ bytes with no line terminator');
+      _buffer = '';
+      return;
+    }
     final (lines, rest) = splitSlcanLines(_buffer);
     _buffer = rest;
     for (final line in lines) {
@@ -328,9 +344,13 @@ class SlcanBackend implements CanBackend {
   /// adapter whose firmware doesn't implement `V`.
   bool probe = true;
 
+  /// Where the port list comes from; a test hands in a pty.
+  @visibleForTesting
+  static List<String> Function() listPorts = () => SerialPort.availablePorts;
+
   @override
   Future<List<CanDevice>> discover() async {
-    final infos = SerialPort.availablePorts.map(_inspect).toList();
+    final infos = listPorts().map(_inspect).toList();
 
     if (!probe) {
       return [
@@ -344,6 +364,7 @@ class SlcanBackend implements CanBackend {
 
     final candidates =
         infos.where((i) => slcanWorthProbing(i.path, i.transport)).toList();
+    if (candidates.isEmpty) return [];
     final paths = candidates.map((i) => i.path).toList();
     // Each probe blocks up to 300 ms; keep that off the UI isolate.
     final probes = await Isolate.run(() => paths.map(probeSlcanPort).toList());

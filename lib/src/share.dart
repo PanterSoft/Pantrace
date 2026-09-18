@@ -8,6 +8,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import 'backends/slcan.dart';
 import 'can.dart';
@@ -118,6 +119,12 @@ class CanShare {
       }).codeUnits);
     }
   }
+
+  /// Adds a client whose write always throws, to test that relay() drops a
+  /// client that misbehaves instead of propagating the error. Tests only.
+  @visibleForTesting
+  void injectBrokenClientForTest(void Function() onWrite) =>
+      _clients.add(_Client((_) => onWrite()));
 
   /// Forward a frame to every client except [except]. Pantrace's own Send
   /// calls this for backends that don't echo transmissions.

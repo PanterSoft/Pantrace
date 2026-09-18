@@ -92,4 +92,37 @@ void main() {
     b.destroy();
     await share.stop();
   });
+
+  test('falls back to an ephemeral port when the fixed one is taken', () async {
+    final blocker = await ServerSocket.bind(InternetAddress.loopbackIPv4, shareTcpPort);
+    final bus = _FakeBus();
+    final share = CanShare(bus, onClientSent: (_) {});
+    try {
+      final endpoints = await share.start();
+      final port = int.parse(endpoints.first.split(':').last);
+      expect(port, isNot(shareTcpPort));
+    } finally {
+      await share.stop();
+      await blocker.close();
+    }
+  });
+
+  test('a client whose write throws is dropped, not left broken', () async {
+    final bus = _FakeBus();
+    final share = CanShare(bus, onClientSent: (_) {});
+    await share.start();
+    var calls = 0;
+    // Same _Client shape the socket/pty paths use, reached through relay().
+    share.injectBrokenClientForTest(() {
+      calls++;
+      throw const SocketException('broken pipe');
+    });
+    // Must not throw back out to the caller.
+    share.relay(CanFrame(id: 0x100, data: Uint8List(0)));
+    expect(calls, 1);
+    // The broken client was removed: a second relay does not call it again.
+    share.relay(CanFrame(id: 0x100, data: Uint8List(0)));
+    expect(calls, 1);
+    await share.stop();
+  });
 }

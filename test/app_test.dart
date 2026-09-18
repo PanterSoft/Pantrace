@@ -96,9 +96,16 @@ void main() {
     final state = tester.state(find.byType(TracerPage)) as dynamic;
     expect(state.model.groupedRows.map((r) => r.channel).toSet(), {0, 1});
 
-    // Sending offers a channel choice.
+    // Sending offers a channel choice, and both channels are selectable
+    // once connected.
     await tester.tap(find.text('Send'));
     await tester.pumpAndSettle();
     expect(find.text('CAN2'), findsWidgets);
+    await tester.tap(find.text('CAN2').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(state.model.groupedRows.where((r) => r.channel == 1 && r.id == 0x123).single.count,
+        greaterThan(0));
   });
 }

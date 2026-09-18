@@ -92,6 +92,30 @@ void main() {
       m.dispose();
     });
 
+    test('sorting by data compares bytes, then shorter payload first', () {
+      final m = TraceModel();
+      m.add(f(0x100, [1, 2]));
+      m.add(f(0x200, [1, 2, 3])); // shares the [1, 2] prefix, one byte longer
+      m.add(f(0x300, [1, 1]));
+
+      m.setSort(TraceSort.data);
+      expect(m.groupedRows.map((r) => r.id), [0x300, 0x100, 0x200]);
+      m.dispose();
+    });
+
+    test('two rows that both have a cycle time compare by period', () {
+      final m = TraceModel();
+      final t = DateTime(2024);
+      m.add(f(0x100, [0], t: t));
+      m.add(f(0x100, [0], t: t.add(const Duration(milliseconds: 50))));
+      m.add(f(0x200, [0], t: t));
+      m.add(f(0x200, [0], t: t.add(const Duration(milliseconds: 10))));
+
+      m.setSort(TraceSort.cycle);
+      expect(m.groupedRows.map((r) => r.id), [0x200, 0x100]);
+      m.dispose();
+    });
+
     test('collapses repeats of one id into a single row', () {
       final m = TraceModel();
       for (var i = 0; i < 10; i++) {

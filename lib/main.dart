@@ -15,11 +15,11 @@ import 'src/share.dart';
 import 'src/trace.dart';
 import 'src/update.dart';
 
-void main() => runApp(const PantraceApp());
+void main() => runApp(const PantraceApp()); // coverage:ignore-line
 
 /// macOS wants app actions in the system menu bar; Flutter ships no native
 /// menu delegate for Windows/Linux, so those keep the toolbar overflow menu.
-final _nativeMenus = defaultTargetPlatform == TargetPlatform.macOS;
+bool get _nativeMenus => defaultTargetPlatform == TargetPlatform.macOS;
 
 const _r = BorderRadius.all(Radius.circular(4));
 const _btn = ButtonStyle(
@@ -374,7 +374,12 @@ class _TracerPageState extends State<TracerPage> {
     final page = Scaffold(
       body: Column(
         children: [
-          _Toolbar(state: this),
+          // The toolbar shows model state too (pause, view, DBC), so it must
+          // follow the model, not only setState.
+          ListenableBuilder(
+            listenable: model,
+            builder: (context, _) => _Toolbar(state: this),
+          ),
           const Divider(height: 1),
           Expanded(
             child: ListenableBuilder(

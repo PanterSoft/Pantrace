@@ -1,9 +1,40 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:pantrace/main.dart';
 import 'package:pantrace/src/update.dart';
 import 'package:flutter_test/flutter_test.dart';
+
+/// A stand-in for api.github.com / github.com on localhost.
+class _GitHub {
+  late HttpServer server;
+  String tag = 'v9.9.9';
+  int status = 200;
+  List<int> asset = utf8.encode('installer bytes');
+  bool chunked = false; // no Content-Length, so no progress is possible
+
+  Future<void> start() async {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((req) async {
+      req.response.statusCode = status;
+      if (status == 200 && req.uri.path.endsWith('/releases/latest')) {
+        req.response.write(jsonEncode({'tag_name': tag}));
+      } else if (status == 200) {
+        if (!chunked) req.response.contentLength = asset.length;
+        req.response.add(asset);
+      }
+      await req.response.close();
+    });
+    apiBase = downloadBase = 'http://127.0.0.1:${server.port}';
+  }
+
+  Future<void> stop() async {
+    await server.close(force: true);
+    apiBase = 'https://api.github.com';
+    downloadBase = 'https://github.com';
+  }
+}
 
 void main() {
   test('isNewer compares semver tags', () {
@@ -13,6 +44,95 @@ void main() {
     expect(isNewer('v1.0.0', '1.0.0'), isFalse);
     expect(isNewer('v0.9.0', '1.0.0'), isFalse);
     expect(isNewer('v1.0.0', '0.0.0'), isTrue); // unversioned dev build
+  });
+
+  group('against a local GitHub', () {
+    final gh = _GitHub();
+    HttpOverrides? mock;
+    setUp(() {
+      // flutter_test swaps HttpClient for a 400-everything mock; this group
+      // wants the real one, talking to the local server.
+      mock = HttpOverrides.current;
+      HttpOverrides.global = null;
+      gh
+        ..status = 200
+        ..tag = 'v9.9.9'
+        ..chunked = false;
+      return gh.start();
+    });
+    tearDown(() {
+      HttpOverrides.global = mock;
+      return gh.stop();
+    });
+
+    test('checkForUpdate reports a newer tag, nothing when current', () async {
+      expect(await checkForUpdate(), 'v9.9.9');
+      gh.tag = appVersion; // whatever this build is, it is not newer
+      expect(await checkForUpdate(), isNull);
+      gh.status = 403;
+      await expectLater(checkForUpdate(), throwsA(isA<HttpException>()));
+    });
+
+    test('download streams to a file and reports progress', () async {
+      final out = File('${Directory.systemTemp.createTempSync().path}/asset');
+      final progress = <double>[];
+      await download('$downloadBase/x', out, progress.add);
+      expect(out.readAsStringSync(), 'installer bytes');
+      expect(progress.last, 1.0);
+
+      gh.chunked = true;
+      progress.clear();
+      await download('$downloadBase/x', out, progress.add);
+      expect(progress, isEmpty);
+      await download('$downloadBase/x', out, null);
+
+      gh.status = 404;
+      await expectLater(download('$downloadBase/x', out, null),
+          throwsA(predicate((e) => '$e'.contains('download failed (404)'))));
+    });
+
+    test('a failed download leaves the running install alone', () async {
+      gh.status = 500;
+      os = 'macos';
+      try {
+        await expectLater(downloadAndInstall('v9.9.9'), throwsA(isA<HttpException>()));
+      } finally {
+        os = Platform.operatingSystem;
+      }
+    });
+  });
+
+  test('the platform decides between self-install and the browser', () {
+    final calls = <String>[];
+    final realLaunch = launch;
+    launch = (cmd, args) async {
+      calls.add('$cmd ${args.join(' ')}');
+      return ProcessResult(0, 0, '', '');
+    };
+    try {
+      os = 'windows';
+      expect(canSelfInstall, isTrue);
+      expect(assetUrl('v1.2.3'), endsWith('/v1.2.3/Pantrace-windows-x64-setup.exe'));
+      openReleasePage();
+      os = 'macos';
+      expect(assetUrl('v1.2.3'), endsWith('/v1.2.3/Pantrace-macos.dmg'));
+      openReleasePage();
+      os = 'linux';
+      expect(canSelfInstall, isFalse);
+      openReleasePage();
+      expect(calls, [
+        'cmd /c start  $releasesUrl',
+        'open $releasesUrl',
+        'xdg-open $releasesUrl',
+      ]);
+    } finally {
+      os = Platform.operatingSystem;
+      launch = realLaunch;
+    }
+  });
+
+  test('the default launcher runs a real process', () async {
+    expect((await launch('true', [])).exitCode, 0);
   });
 
   testWidgets('the overflow menu offers a manual update check', (tester) async {
@@ -30,6 +150,11 @@ void main() {
     expect(find.textContaining('Update check failed'), findsOneWidget);
   });
 
+  test('shellQuote escapes single quotes for /bin/sh', () {
+    expect(shellQuote('plain'), "'plain'");
+    expect(shellQuote("it's a path"), r"'it'\''s a path'");
+  });
+
   test('the install asset is one CI actually publishes', () {
     // Renaming a release asset would otherwise 404 only at install time.
     final built = File('.github/workflows/ci.yml').readAsStringSync() +
@@ -37,8 +162,12 @@ void main() {
     for (final name in ['Pantrace-windows-x64-setup', 'Pantrace-macos.dmg']) {
       expect(built, contains(name));
     }
-    if (!canSelfInstall) return; // Linux: the .deb needs root, browser instead
-    expect(assetUrl('v1.2.3'),
-        matches(r'^https://github\.com/.+/releases/download/v1\.2\.3/Pantrace-'));
+    os = 'macos';
+    try {
+      expect(assetUrl('v1.2.3'),
+          matches(r'^https://github\.com/.+/releases/download/v1\.2\.3/Pantrace-'));
+    } finally {
+      os = Platform.operatingSystem;
+    }
   });
 }

@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../can.dart';
 
@@ -96,34 +97,57 @@ const _paramChannelCondition = 0x07;
 const _channelUnavailable = 0x00;
 
 typedef _InitC = Uint32 Function(Uint16, Uint16, Uint8, Uint32, Uint16);
-typedef _InitD = int Function(int, int, int, int, int);
+typedef PcanInit = int Function(int, int, int, int, int);
 typedef _UninitC = Uint32 Function(Uint16);
-typedef _UninitD = int Function(int);
+typedef PcanUninit = int Function(int);
 typedef _ReadC = Uint32 Function(Uint16, Pointer<Uint8>, Pointer<Uint8>);
-typedef _ReadD = int Function(int, Pointer<Uint8>, Pointer<Uint8>);
+typedef PcanRead = int Function(int, Pointer<Uint8>, Pointer<Uint8>);
 typedef _WriteC = Uint32 Function(Uint16, Pointer<Uint8>);
-typedef _WriteD = int Function(int, Pointer<Uint8>);
+typedef PcanWrite = int Function(int, Pointer<Uint8>);
 typedef _GetValueC = Uint32 Function(Uint16, Uint8, Pointer<Uint8>, Uint32);
-typedef _GetValueD = int Function(int, int, Pointer<Uint8>, int);
+typedef PcanGetValue = int Function(int, int, Pointer<Uint8>, int);
 typedef _ErrTextC = Uint32 Function(Uint32, Uint16, Pointer<Uint8>);
-typedef _ErrTextD = int Function(int, int, Pointer<Uint8>);
+typedef PcanErrText = int Function(int, int, Pointer<Uint8>);
 
-class _Pcan {
-  final DynamicLibrary lib;
-  late final init = lib.lookupFunction<_InitC, _InitD>('CAN_Initialize');
-  late final uninit = lib.lookupFunction<_UninitC, _UninitD>('CAN_Uninitialize');
-  late final read = lib.lookupFunction<_ReadC, _ReadD>('CAN_Read');
-  late final write = lib.lookupFunction<_WriteC, _WriteD>('CAN_Write');
-  late final getValue =
-      lib.lookupFunction<_GetValueC, _GetValueD>('CAN_GetValue');
-  late final errText = lib.lookupFunction<_ErrTextC, _ErrTextD>('CAN_GetErrorText');
-  _Pcan(this.lib);
+/// The PCANBasic entry points as plain Dart functions, so a test can stand in
+/// for the driver without hardware.
+class PcanDriver {
+  final PcanInit init;
+  final PcanUninit uninit;
+  final PcanRead read;
+  final PcanWrite write;
+  final PcanGetValue getValue;
+  final PcanErrText errText;
+
+  PcanDriver({
+    required this.init,
+    required this.uninit,
+    required this.read,
+    required this.write,
+    required this.getValue,
+    required this.errText,
+  });
+
+  PcanDriver.fromLibrary(DynamicLibrary lib)
+      : init = lib.lookupFunction<_InitC, PcanInit>('CAN_Initialize'),
+        uninit = lib.lookupFunction<_UninitC, PcanUninit>('CAN_Uninitialize'),
+        read = lib.lookupFunction<_ReadC, PcanRead>('CAN_Read'),
+        write = lib.lookupFunction<_WriteC, PcanWrite>('CAN_Write'),
+        getValue = lib.lookupFunction<_GetValueC, PcanGetValue>('CAN_GetValue'),
+        errText = lib.lookupFunction<_ErrTextC, PcanErrText>('CAN_GetErrorText');
 }
 
-_Pcan? _pcan;
+PcanDriver? _pcan;
 bool _pcanTried = false;
 
-_Pcan? get _p {
+/// Replace (or, with null, remove) the driver. Tests only.
+@visibleForTesting
+set pcanDriver(PcanDriver? d) {
+  _pcan = d;
+  _pcanTried = true;
+}
+
+PcanDriver? get _p {
   if (_pcanTried) return _pcan;
   _pcanTried = true;
   final names = Platform.isWindows
@@ -133,8 +157,8 @@ _Pcan? get _p {
           : ['libpcanbasic.so', 'libpcanbasic.so.4'];
   for (final n in names) {
     try {
-      _pcan = _Pcan(DynamicLibrary.open(n));
-      return _pcan;
+      _pcan = PcanDriver.fromLibrary(DynamicLibrary.open(n));
+      return _pcan; // coverage:ignore-line
     } catch (_) {
       // Try the next candidate path.
     }
@@ -163,8 +187,8 @@ class PcanBus implements CanBus {
   Timer? _poll;
   final _frames = StreamController<CanFrame>.broadcast();
   final _status = StreamController<String>.broadcast();
-  late final Pointer<Uint8> _msgBuf;
-  late final Pointer<Uint8> _tsBuf;
+  late Pointer<Uint8> _msgBuf;
+  late Pointer<Uint8> _tsBuf;
 
   @override
   Stream<CanFrame> get frames => _frames.stream;
