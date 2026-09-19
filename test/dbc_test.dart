@@ -79,6 +79,17 @@ void main() {
       expect(s.comment, 'Crankshaft speed, 0.25 rpm resolution');
     });
 
+    test('a comment can wrap across multiple lines', () {
+      final db2 = parseDbc('''
+BO_ 100 Msg: 1 ECU
+ SG_ Sig : 0|8@1+ (1,0) [0|255] "" Dashboard
+
+CM_ BO_ 100 "line one
+line two";
+''');
+      expect(db2.lookup(100, false)!.comment, 'line one\nline two');
+    });
+
     test('extended id strips the DBC flag bit', () {
       // 2566811646 == 0x98FE6FFE, flag bit set -> 0x18FE6FFE extended.
       final m = db.lookup(0x18FE6FFE, true)!;

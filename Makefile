@@ -26,8 +26,11 @@ build: deps ## Release build for $(OS)
 run: deps ## Run on $(OS)
 	flutter run -d $(OS) $(DEFINES)
 
-test: deps ## Run tests
-	flutter test
+test: deps ## Run tests (builds a local libserialport so SLCAN tests run for real)
+	@[ -f build/test/libserialport.$(if $(filter Darwin,$(UNAME)),dylib,so) ] || \
+		tools/build-test-libserialport.sh
+	LIBSERIALPORT_PATH=$(CURDIR)/build/test/libserialport.$(if $(filter Darwin,$(UNAME)),dylib,so) \
+		flutter test --coverage
 
 analyze: deps ## Static analysis
 	flutter analyze

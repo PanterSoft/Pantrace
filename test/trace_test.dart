@@ -9,7 +9,113 @@ CanFrame f(int id, List<int> data, {bool ext = false, DateTime? t}) =>
     CanFrame(id: id, data: b(data), extended: ext, timestamp: t);
 
 void main() {
+  group('error frames', () {
+    test('are counted, shown live, and kept out of rows and rate stats', () {
+      final m = TraceModel();
+      m.add(f(0x123, [1]));
+      m.add(CanFrame.error('bus off'));
+      expect(m.errorFrames, 1);
+      expect(m.totalFrames, 1); // error frames do not inflate the frame count
+      expect(m.groupedRows.length, 1);
+      expect(m.liveFrames.first.error, 'bus off');
+      m.clear();
+      expect(m.errorFrames, 0);
+      m.dispose();
+    });
+
+    test('stay visible through an id filter and land in the CSV', () {
+      final m = TraceModel();
+      m.add(f(0x123, [1]));
+      m.add(CanFrame.error('no ACK'));
+      m.setFilter('456');
+      expect(m.liveFrames.map((x) => x.error), ['no ACK']);
+      expect(m.toCsv(), contains(',error,,,,"no ACK"'));
+      m.dispose();
+    });
+  });
+
+  group('channels', () {
+    test('the same id on two buses is two rows, adjacent by default', () {
+      final m = TraceModel();
+      m.add(f(0x200, [0]).withChannel(1));
+      m.add(f(0x100, [0]).withChannel(1));
+      m.add(f(0x100, [0]).withChannel(0));
+      expect(m.groupedRows.map((r) => (r.id, r.channel)),
+          [(0x100, 0), (0x100, 1), (0x200, 1)]);
+      m.setSort(TraceSort.channel);
+      expect(m.groupedRows.map((r) => r.channel), [0, 1, 1]);
+      m.dispose();
+    });
+
+    test('bus load is tracked per channel', () async {
+      final m = TraceModel();
+      m.bitrates[1] = 125000;
+      m.add(f(0x100, [0, 0, 0, 0, 0, 0, 0, 0]).withChannel(1));
+      await Future<void>.delayed(const Duration(milliseconds: 70));
+      expect(m.busLoadPercent[0], 0);
+      expect(m.busLoadPercent[1], greaterThan(0));
+      m.dispose();
+    });
+  });
+
   group('grouping', () {
+    test('sorts by the selected column and toggles direction', () {
+      final m = TraceModel();
+      m.add(f(0x200, [0]));
+      m.add(f(0x100, [0, 0, 0]));
+      m.add(f(0x100, [0, 0, 0]));
+
+      m.setSort(TraceSort.count);
+      expect(m.groupedRows.map((r) => r.id), [0x200, 0x100]);
+      m.setSort(TraceSort.count); // same column again flips
+      expect(m.sortAscending, isFalse);
+      expect(m.groupedRows.map((r) => r.id), [0x100, 0x200]);
+
+      m.setSort(TraceSort.length);
+      expect(m.sortAscending, isTrue);
+      expect(m.groupedRows.map((r) => r.id), [0x200, 0x100]);
+
+      m.dispose();
+    });
+
+    test('sorting by cycle keeps rows without one last in both directions', () {
+      final m = TraceModel();
+      final t = DateTime(2024);
+      m.add(f(0x100, [0], t: t)); // seen once: no cycle time
+      m.add(f(0x300, [0], t: t));
+      m.add(f(0x300, [0], t: t.add(const Duration(milliseconds: 10))));
+
+      m.setSort(TraceSort.cycle);
+      expect(m.groupedRows.map((r) => r.id), [0x300, 0x100]);
+      m.setSort(TraceSort.cycle);
+      expect(m.groupedRows.map((r) => r.id), [0x300, 0x100]);
+      m.dispose();
+    });
+
+    test('sorting by data compares bytes, then shorter payload first', () {
+      final m = TraceModel();
+      m.add(f(0x100, [1, 2]));
+      m.add(f(0x200, [1, 2, 3])); // shares the [1, 2] prefix, one byte longer
+      m.add(f(0x300, [1, 1]));
+
+      m.setSort(TraceSort.data);
+      expect(m.groupedRows.map((r) => r.id), [0x300, 0x100, 0x200]);
+      m.dispose();
+    });
+
+    test('two rows that both have a cycle time compare by period', () {
+      final m = TraceModel();
+      final t = DateTime(2024);
+      m.add(f(0x100, [0], t: t));
+      m.add(f(0x100, [0], t: t.add(const Duration(milliseconds: 50))));
+      m.add(f(0x200, [0], t: t));
+      m.add(f(0x200, [0], t: t.add(const Duration(milliseconds: 10))));
+
+      m.setSort(TraceSort.cycle);
+      expect(m.groupedRows.map((r) => r.id), [0x200, 0x100]);
+      m.dispose();
+    });
+
     test('collapses repeats of one id into a single row', () {
       final m = TraceModel();
       for (var i = 0; i < 10; i++) {
@@ -152,28 +258,10 @@ BO_ 291 EngineData: 8 ECM
  SG_ EngineSpeed : 0|16@1+ (0.25,0) [0|16383] "rpm" ECM
 ''';
 
-    test('only-known filter hides undecodable ids', () {
-      final m = TraceModel()..loadDbc(parseDbc(dbc), 'test.dbc');
-      m.add(f(291, [0, 0]));
-      m.add(f(0x777, [0, 0]));
-      expect(m.groupedRows.length, 2);
-      m.setOnlyKnown(true);
-      expect(m.groupedRows.length, 1);
-      expect(m.groupedRows.first.id, 291);
-      m.dispose();
-    });
-
-    test('only-known with no dbc loaded hides everything', () {
-      final m = TraceModel()..setOnlyKnown(true);
-      m.add(f(291, [0, 0]));
-      expect(m.groupedRows, isEmpty);
-      m.dispose();
-    });
-
     test('lookup resolves a message for a traced id', () {
-      final m = TraceModel()..loadDbc(parseDbc(dbc), 'test.dbc');
-      expect(m.messageFor(291, false)!.name, 'EngineData');
-      expect(m.messageFor(292, false), isNull);
+      final m = TraceModel()..loadDbc(0, parseDbc(dbc), 'test.dbc');
+      expect(m.messageFor(0, 291, false)!.name, 'EngineData');
+      expect(m.messageFor(0, 292, false), isNull);
       m.dispose();
     });
   });
@@ -192,7 +280,7 @@ BO_ 291 EngineData: 8 ECM
       m.add(f(0x123, [0xDE, 0xAD]));
       m.add(f(0x7FF, [], ext: true));
       final lines = m.toCsv().trim().split('\n');
-      expect(lines[0], startsWith('timestamp,direction,id'));
+      expect(lines[0], startsWith('timestamp,channel,direction,id'));
       expect(lines.length, 3);
       expect(lines[1], contains('123'));
       expect(lines[1], contains('DEAD'));

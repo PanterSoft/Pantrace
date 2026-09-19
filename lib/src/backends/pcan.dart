@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../can.dart';
 
@@ -89,39 +90,64 @@ Map<int, String> pcanCandidateChannels() {
 // Driver bindings
 // ---------------------------------------------------------------------------
 
-const _errOk = 0x00000, _errQrcvEmpty = 0x00020;
+const _errOk = 0x00000, _errQrcvEmpty = 0x00020, _errCaution = 0x2000000;
 const _paramChannelCondition = 0x07;
-const _channelAvailable = 0x01, _channelPcanView = 0x04;
+// PCAN_CHANNEL_AVAILABLE 1, _OCCUPIED 2, _PCANVIEW 3. Occupied channels are
+// still joinable: the PCAN driver shares a channel between client applications.
+const _channelUnavailable = 0x00;
 
 typedef _InitC = Uint32 Function(Uint16, Uint16, Uint8, Uint32, Uint16);
-typedef _InitD = int Function(int, int, int, int, int);
+typedef PcanInit = int Function(int, int, int, int, int);
 typedef _UninitC = Uint32 Function(Uint16);
-typedef _UninitD = int Function(int);
+typedef PcanUninit = int Function(int);
 typedef _ReadC = Uint32 Function(Uint16, Pointer<Uint8>, Pointer<Uint8>);
-typedef _ReadD = int Function(int, Pointer<Uint8>, Pointer<Uint8>);
+typedef PcanRead = int Function(int, Pointer<Uint8>, Pointer<Uint8>);
 typedef _WriteC = Uint32 Function(Uint16, Pointer<Uint8>);
-typedef _WriteD = int Function(int, Pointer<Uint8>);
+typedef PcanWrite = int Function(int, Pointer<Uint8>);
 typedef _GetValueC = Uint32 Function(Uint16, Uint8, Pointer<Uint8>, Uint32);
-typedef _GetValueD = int Function(int, int, Pointer<Uint8>, int);
+typedef PcanGetValue = int Function(int, int, Pointer<Uint8>, int);
 typedef _ErrTextC = Uint32 Function(Uint32, Uint16, Pointer<Uint8>);
-typedef _ErrTextD = int Function(int, int, Pointer<Uint8>);
+typedef PcanErrText = int Function(int, int, Pointer<Uint8>);
 
-class _Pcan {
-  final DynamicLibrary lib;
-  late final init = lib.lookupFunction<_InitC, _InitD>('CAN_Initialize');
-  late final uninit = lib.lookupFunction<_UninitC, _UninitD>('CAN_Uninitialize');
-  late final read = lib.lookupFunction<_ReadC, _ReadD>('CAN_Read');
-  late final write = lib.lookupFunction<_WriteC, _WriteD>('CAN_Write');
-  late final getValue =
-      lib.lookupFunction<_GetValueC, _GetValueD>('CAN_GetValue');
-  late final errText = lib.lookupFunction<_ErrTextC, _ErrTextD>('CAN_GetErrorText');
-  _Pcan(this.lib);
+/// The PCANBasic entry points as plain Dart functions, so a test can stand in
+/// for the driver without hardware.
+class PcanDriver {
+  final PcanInit init;
+  final PcanUninit uninit;
+  final PcanRead read;
+  final PcanWrite write;
+  final PcanGetValue getValue;
+  final PcanErrText errText;
+
+  PcanDriver({
+    required this.init,
+    required this.uninit,
+    required this.read,
+    required this.write,
+    required this.getValue,
+    required this.errText,
+  });
+
+  PcanDriver.fromLibrary(DynamicLibrary lib)
+      : init = lib.lookupFunction<_InitC, PcanInit>('CAN_Initialize'),
+        uninit = lib.lookupFunction<_UninitC, PcanUninit>('CAN_Uninitialize'),
+        read = lib.lookupFunction<_ReadC, PcanRead>('CAN_Read'),
+        write = lib.lookupFunction<_WriteC, PcanWrite>('CAN_Write'),
+        getValue = lib.lookupFunction<_GetValueC, PcanGetValue>('CAN_GetValue'),
+        errText = lib.lookupFunction<_ErrTextC, PcanErrText>('CAN_GetErrorText');
 }
 
-_Pcan? _pcan;
+PcanDriver? _pcan;
 bool _pcanTried = false;
 
-_Pcan? get _p {
+/// Replace (or, with null, remove) the driver. Tests only.
+@visibleForTesting
+set pcanDriver(PcanDriver? d) {
+  _pcan = d;
+  _pcanTried = true;
+}
+
+PcanDriver? get _p {
   if (_pcanTried) return _pcan;
   _pcanTried = true;
   final names = Platform.isWindows
@@ -131,8 +157,8 @@ _Pcan? get _p {
           : ['libpcanbasic.so', 'libpcanbasic.so.4'];
   for (final n in names) {
     try {
-      _pcan = _Pcan(DynamicLibrary.open(n));
-      return _pcan;
+      _pcan = PcanDriver.fromLibrary(DynamicLibrary.open(n));
+      return _pcan; // coverage:ignore-line
     } catch (_) {
       // Try the next candidate path.
     }
@@ -159,10 +185,11 @@ String _errorText(int code) {
 class PcanBus implements CanBus {
   int _channel = 0;
   Timer? _poll;
+  int _lastReadError = _errOk;
   final _frames = StreamController<CanFrame>.broadcast();
   final _status = StreamController<String>.broadcast();
-  late final Pointer<Uint8> _msgBuf;
-  late final Pointer<Uint8> _tsBuf;
+  late Pointer<Uint8> _msgBuf;
+  late Pointer<Uint8> _tsBuf;
 
   @override
   Stream<CanFrame> get frames => _frames.stream;
@@ -181,7 +208,13 @@ class PcanBus implements CanBus {
       throw CanBusException('PCAN does not define a BTR pair for $bitrate bit/s');
     }
     final r = p.init(channel, baud, 0, 0, 0);
-    if (r != _errOk) throw CanBusException(_errorText(r));
+    if (r == _errCaution) {
+      // Another application already runs this channel; we join at its bitrate.
+      _status.add('channel is shared with another application — '
+          'using its bitrate instead of $bitrate bit/s');
+    } else if (r != _errOk) {
+      throw CanBusException(_errorText(r));
+    }
 
     _channel = channel;
     _msgBuf = calloc<Uint8>(pcanMsgSize);
@@ -194,18 +227,27 @@ class PcanBus implements CanBus {
   void _drain() {
     final p = _p;
     if (p == null || _channel == 0) return;
-    for (var i = 0; i < 512; i++) {
+    for (var i = 0; i < 4096; i++) {
       final r = p.read(_channel, _msgBuf, _tsBuf);
-      if (r == _errQrcvEmpty) return;
-      if (r != _errOk) {
+      if (r & _errQrcvEmpty != 0) return;
+      // Any other code (queue overrun, bus light/heavy) still delivers a valid
+      // message. Bailing out here throttled the drain to one frame per tick,
+      // so the queue never recovered and the tracer looked hung.
+      if (r != _errOk && r != _lastReadError) {
+        _lastReadError = r;
         _status.add(_errorText(r));
-        return;
+      } else if (r == _errOk) {
+        _lastReadError = _errOk;
       }
       final raw = Uint8List.fromList(_msgBuf.asTypedList(pcanMsgSize));
       final ts = decodePcanTimestamp(Uint8List.fromList(_tsBuf.asTypedList(8)));
       final frame = decodePcanMsg(raw, timestamp: ts);
       if (frame != null) {
         _frames.add(frame);
+      } else if (raw[4] & _msgErrFrame != 0) {
+        const what = 'error frame on bus';
+        _status.add(what);
+        _frames.add(CanFrame.error(what));
       } else if (raw[4] & _msgStatus != 0) {
         _status.add('bus status change reported by adapter');
       }
@@ -259,7 +301,7 @@ class PcanBackend implements CanBackend {
         final r = p.getValue(entry.key, _paramChannelCondition, buf, 4);
         if (r != _errOk) continue;
         final cond = buf.asTypedList(4)[0];
-        if (cond & (_channelAvailable | _channelPcanView) != 0) {
+        if (cond != _channelUnavailable) {
           out.add(CanDevice(id, '${entry.key}', entry.value));
         }
       }

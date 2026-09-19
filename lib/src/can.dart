@@ -19,6 +19,10 @@ class CanFrame {
   /// Channel index this frame came from, for multi-channel devices.
   final int channel;
 
+  /// Set when this is an error frame rather than bus traffic: the controller's
+  /// description of what went wrong. [id] and [data] are meaningless then.
+  final String? error;
+
   CanFrame({
     required this.id,
     required this.data,
@@ -28,7 +32,37 @@ class CanFrame {
     this.hwTimestamp,
     this.direction = FrameDirection.rx,
     this.channel = 0,
+    this.error,
   }) : timestamp = timestamp ?? DateTime.now();
+
+  /// An error frame, as reported by the controller.
+  CanFrame.error(String this.error, {DateTime? timestamp, this.channel = 0})
+      : id = 0,
+        extended = false,
+        rtr = false,
+        data = _empty,
+        hwTimestamp = null,
+        direction = FrameDirection.rx,
+        timestamp = timestamp ?? DateTime.now();
+
+  static final _empty = Uint8List(0);
+
+  bool get isError => error != null;
+
+  /// The same frame tagged with the app-side bus it arrived on. Overrides the
+  /// driver's own channel index, which is meaningless once two interfaces are
+  /// traced side by side.
+  CanFrame withChannel(int ch) => CanFrame(
+        id: id,
+        data: data,
+        extended: extended,
+        rtr: rtr,
+        timestamp: timestamp,
+        hwTimestamp: hwTimestamp,
+        direction: direction,
+        channel: ch,
+        error: error,
+      );
 
   int get dlc => rtr ? data.length : data.length;
 
@@ -40,7 +74,8 @@ class CanFrame {
       data.map((b) => b.toRadixString(16).toUpperCase().padLeft(2, '0')).join(' ');
 
   @override
-  String toString() => '${extended ? 'x' : ''}$idHex [${data.length}] $dataHex';
+  String toString() =>
+      error ?? '${extended ? 'x' : ''}$idHex [${data.length}] $dataHex';
 }
 
 /// Bitrates we offer in the UI. Every backend maps these to its own encoding.

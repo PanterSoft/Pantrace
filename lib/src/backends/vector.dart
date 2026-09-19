@@ -6,6 +6,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../can.dart';
 
@@ -24,7 +25,11 @@ const _extMsgId = 0x80000000;
 class XlDecoded {
   final CanFrame? frame;
   final String? status;
-  const XlDecoded({this.frame, this.status});
+
+  /// True when [status] describes a bus error rather than a plain notice —
+  /// those also surface as error frames in the trace.
+  final bool isError;
+  const XlDecoded({this.frame, this.status, this.isError = false});
 }
 
 XlDecoded decodeXlEvent(Uint8List raw) {
@@ -42,10 +47,11 @@ XlDecoded decodeXlEvent(Uint8List raw) {
   final dlc = bd.getUint16(22, Endian.little).clamp(0, 8);
 
   if (flags & _flagErrorFrame != 0) {
-    return const XlDecoded(status: 'error frame on bus');
+    return const XlDecoded(status: 'error frame on bus', isError: true);
   }
   if (flags & _flagOverrun != 0) {
-    return const XlDecoded(status: 'receive queue overrun — frames were lost');
+    return const XlDecoded(
+        status: 'receive queue overrun — frames were lost', isError: true);
   }
 
   final extended = rawId & _extMsgId != 0;
@@ -86,54 +92,86 @@ const _xlSuccess = 0, _xlErrQueueEmpty = 10;
 const _busTypeCan = 0x01, _interfaceVersion = 3, _activateResetClock = 8;
 
 typedef _NoArgC = Int16 Function();
-typedef _NoArgD = int Function();
+typedef XlNoArg = int Function();
 typedef _OpenPortC = Int16 Function(
     Pointer<Int32>, Pointer<Utf8>, Uint64, Pointer<Uint64>, Uint32, Uint32, Uint32);
-typedef _OpenPortD = int Function(
+typedef XlOpenPort = int Function(
     Pointer<Int32>, Pointer<Utf8>, int, Pointer<Uint64>, int, int, int);
 typedef _BitrateC = Int16 Function(Int32, Uint64, Uint32);
-typedef _BitrateD = int Function(int, int, int);
+typedef XlBitrate = int Function(int, int, int);
 typedef _ActivateC = Int16 Function(Int32, Uint64, Uint32, Uint32);
-typedef _ActivateD = int Function(int, int, int, int);
+typedef XlActivate = int Function(int, int, int, int);
 typedef _DeactivateC = Int16 Function(Int32, Uint64);
-typedef _DeactivateD = int Function(int, int);
+typedef XlDeactivate = int Function(int, int);
 typedef _ClosePortC = Int16 Function(Int32);
-typedef _ClosePortD = int Function(int);
+typedef XlClosePort = int Function(int);
 typedef _ReceiveC = Int16 Function(Int32, Pointer<Uint32>, Pointer<Uint8>);
-typedef _ReceiveD = int Function(int, Pointer<Uint32>, Pointer<Uint8>);
+typedef XlReceive = int Function(int, Pointer<Uint32>, Pointer<Uint8>);
 typedef _TransmitC = Int16 Function(Int32, Uint64, Pointer<Uint32>, Pointer<Uint8>);
-typedef _TransmitD = int Function(int, int, Pointer<Uint32>, Pointer<Uint8>);
+typedef XlTransmit = int Function(int, int, Pointer<Uint32>, Pointer<Uint8>);
 typedef _ErrStrC = Pointer<Utf8> Function(Int16);
-typedef _ErrStrD = Pointer<Utf8> Function(int);
+typedef XlErrStr = Pointer<Utf8> Function(int);
 
-class _Xl {
-  final DynamicLibrary lib;
-  late final openDriver = lib.lookupFunction<_NoArgC, _NoArgD>('xlOpenDriver');
-  late final closeDriver = lib.lookupFunction<_NoArgC, _NoArgD>('xlCloseDriver');
-  late final openPort = lib.lookupFunction<_OpenPortC, _OpenPortD>('xlOpenPort');
-  late final setBitrate =
-      lib.lookupFunction<_BitrateC, _BitrateD>('xlCanSetChannelBitrate');
-  late final activate =
-      lib.lookupFunction<_ActivateC, _ActivateD>('xlActivateChannel');
-  late final deactivate =
-      lib.lookupFunction<_DeactivateC, _DeactivateD>('xlDeactivateChannel');
-  late final closePort = lib.lookupFunction<_ClosePortC, _ClosePortD>('xlClosePort');
-  late final receive = lib.lookupFunction<_ReceiveC, _ReceiveD>('xlReceive');
-  late final transmit = lib.lookupFunction<_TransmitC, _TransmitD>('xlCanTransmit');
-  late final errString = lib.lookupFunction<_ErrStrC, _ErrStrD>('xlGetErrorString');
-  _Xl(this.lib);
+/// The XL Driver Library entry points as plain Dart functions, so a test can
+/// stand in for the driver without hardware.
+class XlDriver {
+  final XlNoArg openDriver;
+  final XlNoArg closeDriver;
+  final XlOpenPort openPort;
+  final XlBitrate setBitrate;
+  final XlActivate activate;
+  final XlDeactivate deactivate;
+  final XlClosePort closePort;
+  final XlReceive receive;
+  final XlTransmit transmit;
+  final XlErrStr errString;
+
+  XlDriver({
+    required this.openDriver,
+    required this.closeDriver,
+    required this.openPort,
+    required this.setBitrate,
+    required this.activate,
+    required this.deactivate,
+    required this.closePort,
+    required this.receive,
+    required this.transmit,
+    required this.errString,
+  });
+
+  XlDriver.fromLibrary(DynamicLibrary lib)
+      : openDriver = lib.lookupFunction<_NoArgC, XlNoArg>('xlOpenDriver'),
+        closeDriver = lib.lookupFunction<_NoArgC, XlNoArg>('xlCloseDriver'),
+        openPort = lib.lookupFunction<_OpenPortC, XlOpenPort>('xlOpenPort'),
+        setBitrate =
+            lib.lookupFunction<_BitrateC, XlBitrate>('xlCanSetChannelBitrate'),
+        activate = lib.lookupFunction<_ActivateC, XlActivate>('xlActivateChannel'),
+        deactivate =
+            lib.lookupFunction<_DeactivateC, XlDeactivate>('xlDeactivateChannel'),
+        closePort = lib.lookupFunction<_ClosePortC, XlClosePort>('xlClosePort'),
+        receive = lib.lookupFunction<_ReceiveC, XlReceive>('xlReceive'),
+        transmit = lib.lookupFunction<_TransmitC, XlTransmit>('xlCanTransmit'),
+        errString = lib.lookupFunction<_ErrStrC, XlErrStr>('xlGetErrorString');
 }
 
-_Xl? _xl;
+XlDriver? _xl;
 bool _xlTried = false;
 
-_Xl? get _x {
+/// Replace (or, with null, remove) the driver. Tests only.
+@visibleForTesting
+set xlDriver(XlDriver? d) {
+  _xl = d;
+  _xlTried = true;
+}
+
+XlDriver? get _x {
   if (_xlTried) return _xl;
   _xlTried = true;
   if (!Platform.isWindows) return null;
+  // coverage:ignore-start needs the Windows only vxlapi DLL
   for (final n in ['vxlapi64.dll', 'vxlapi.dll']) {
     try {
-      final lib = _Xl(DynamicLibrary.open(n));
+      final lib = XlDriver.fromLibrary(DynamicLibrary.open(n));
       if (lib.openDriver() == _xlSuccess) {
         _xl = lib;
         return _xl;
@@ -143,6 +181,7 @@ _Xl? get _x {
     }
   }
   return null;
+  // coverage:ignore-end
 }
 
 String _xlError(int status) {
@@ -161,8 +200,8 @@ class VectorBus implements CanBus {
   Timer? _poll;
   final _frames = StreamController<CanFrame>.broadcast();
   final _status = StreamController<String>.broadcast();
-  late final Pointer<Uint8> _evBuf;
-  late final Pointer<Uint32> _count;
+  late Pointer<Uint8> _evBuf;
+  late Pointer<Uint32> _count;
 
   @override
   Stream<CanFrame> get frames => _frames.stream;
@@ -234,7 +273,10 @@ class VectorBus implements CanBus {
       final decoded =
           decodeXlEvent(Uint8List.fromList(_evBuf.asTypedList(xlEventSize)));
       if (decoded.frame != null) _frames.add(decoded.frame!);
-      if (decoded.status != null) _status.add(decoded.status!);
+      if (decoded.status != null) {
+        _status.add(decoded.status!);
+        if (decoded.isError) _frames.add(CanFrame.error(decoded.status!));
+      }
     }
   }
 

@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 
 import '../can.dart';
@@ -160,8 +161,10 @@ bool slcanLooksLikeReply(String reply) {
       ..stopBits = 1
       ..setFlowControl(SerialPortFlowControl.none);
     port.flush();
-    // 'C' first so an adapter left open by a crashed session still replies.
-    port.write(Uint8List.fromList('C\rV\r'.codeUnits), timeout: 100);
+    // No 'C' here: it would close the CAN channel of another application
+    // using the adapter. An already-open adapter answers V with BELL, which
+    // slcanLooksLikeReply accepts.
+    port.write(Uint8List.fromList('V\r'.codeUnits), timeout: 100);
     final buf = StringBuffer();
     final deadline = DateTime.now().add(const Duration(milliseconds: 300));
     while (DateTime.now().isBefore(deadline)) {
@@ -253,15 +256,36 @@ class SlcanBus implements CanBus {
     _write('O\r');
 
     _sub = SerialPortReader(port).stream.listen(
-          _onData,
-          onError: (Object e) => _status.add('serial error: $e'),
-        );
+      _onData,
+      onError: (Object e) {
+        // Usually the adapter was unplugged; the port is dead from here on.
+        _status.add('serial error: $e');
+        close();
+      },
+    );
   }
+
+  /// Longest legit line is a timestamped 29-bit/8-byte frame (30 chars);
+  /// leave headroom. Guards against a buffer that grows without bound if a
+  /// noisy line (or a misidentified device) never sends the \r terminator.
+  static const _maxLineLength = 256;
+
+  /// Feeds bytes through the exact path a real read would. Tests only — it
+  /// lets the receive-buffer bound be exercised without a live serial port.
+  @visibleForTesting
+  void feedForTest(Uint8List chunk) => _onData(chunk);
 
   void _onData(Uint8List chunk) {
     _buffer += String.fromCharCodes(chunk);
     final (lines, rest) = splitSlcanLines(_buffer);
     _buffer = rest;
+    // Bound only the unterminated tail: a big chunk of complete lines (what
+    // arrives after the OS buffered serial input while we were napping) is
+    // legitimate traffic, not garbage.
+    if (_buffer.length > _maxLineLength) {
+      _status.add('discarding $_maxLineLength+ bytes with no line terminator');
+      _buffer = '';
+    }
     for (final line in lines) {
       if (line.codeUnitAt(0) == 7) {
         // BEL: adapter rejected the previous command or saw a bus error.
@@ -273,7 +297,13 @@ class SlcanBus implements CanBus {
     }
   }
 
-  void _write(String s) => _port?.write(Uint8List.fromList(s.codeUnits));
+  void _write(String s) {
+    try {
+      _port?.write(Uint8List.fromList(s.codeUnits));
+    } on SerialPortError catch (e) {
+      _status.add('serial error: $e');
+    }
+  }
 
   @override
   Future<void> send(CanFrame frame) async {
@@ -283,12 +313,21 @@ class SlcanBus implements CanBus {
 
   @override
   Future<void> close() async {
+    final port = _port;
+    if (port == null) return;
+    _port = null;
     _write('C\r');
     await _sub?.cancel();
     _sub = null;
-    _port?.close();
-    _port?.dispose();
-    _port = null;
+    // macOS blocks forever in close() on a yanked USB serial device, so close
+    // off the UI isolate and give up after a while (the fd leaks, the OS
+    // reclaims it on exit).
+    final addr = port.address;
+    await Isolate.run(() {
+      final p = SerialPort.fromAddress(addr);
+      p.close();
+      p.dispose();
+    }).timeout(const Duration(seconds: 2), onTimeout: () {});
   }
 }
 
@@ -307,9 +346,13 @@ class SlcanBackend implements CanBackend {
   /// adapter whose firmware doesn't implement `V`.
   bool probe = true;
 
+  /// Where the port list comes from; a test hands in a pty.
+  @visibleForTesting
+  static List<String> Function() listPorts = () => SerialPort.availablePorts;
+
   @override
   Future<List<CanDevice>> discover() async {
-    final infos = SerialPort.availablePorts.map(_inspect).toList();
+    final infos = listPorts().map(_inspect).toList();
 
     if (!probe) {
       return [
@@ -323,6 +366,7 @@ class SlcanBackend implements CanBackend {
 
     final candidates =
         infos.where((i) => slcanWorthProbing(i.path, i.transport)).toList();
+    if (candidates.isEmpty) return [];
     final paths = candidates.map((i) => i.path).toList();
     // Each probe blocks up to 300 ms; keep that off the UI isolate.
     final probes = await Isolate.run(() => paths.map(probeSlcanPort).toList());

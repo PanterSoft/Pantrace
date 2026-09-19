@@ -5,6 +5,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../can.dart';
 
@@ -73,39 +74,62 @@ const _siocgifindex = 0x8933;
 const _fSetfl = 4, _oNonblock = 0x800;
 
 typedef _SocketC = Int32 Function(Int32, Int32, Int32);
-typedef _SocketD = int Function(int, int, int);
+typedef LibcSocket = int Function(int, int, int);
 typedef _BindC = Int32 Function(Int32, Pointer<Uint8>, Uint32);
-typedef _BindD = int Function(int, Pointer<Uint8>, int);
+typedef LibcBind = int Function(int, Pointer<Uint8>, int);
 typedef _IoctlC = Int32 Function(Int32, UnsignedLong, Pointer<Uint8>);
-typedef _IoctlD = int Function(int, int, Pointer<Uint8>);
+typedef LibcIoctl = int Function(int, int, Pointer<Uint8>);
 typedef _RwC = IntPtr Function(Int32, Pointer<Uint8>, IntPtr);
-typedef _RwD = int Function(int, Pointer<Uint8>, int);
+typedef LibcRw = int Function(int, Pointer<Uint8>, int);
 typedef _CloseC = Int32 Function(Int32);
-typedef _CloseD = int Function(int);
+typedef LibcClose = int Function(int);
 typedef _FcntlC = Int32 Function(Int32, Int32, Int32);
-typedef _FcntlD = int Function(int, int, int);
+typedef LibcFcntl = int Function(int, int, int);
 
-class _Libc {
-  final DynamicLibrary lib;
-  late final socket = lib.lookupFunction<_SocketC, _SocketD>('socket');
-  late final bind = lib.lookupFunction<_BindC, _BindD>('bind');
-  late final ioctl = lib.lookupFunction<_IoctlC, _IoctlD>('ioctl');
-  late final read = lib.lookupFunction<_RwC, _RwD>('read');
-  late final write = lib.lookupFunction<_RwC, _RwD>('write');
-  late final close = lib.lookupFunction<_CloseC, _CloseD>('close');
-  late final fcntl = lib.lookupFunction<_FcntlC, _FcntlD>('fcntl');
-  _Libc(this.lib);
+/// The libc calls SocketCAN needs, as plain Dart functions so a test can stand
+/// in for the kernel without a CAN netdev.
+class Libc {
+  final LibcSocket socket;
+  final LibcBind bind;
+  final LibcIoctl ioctl;
+  final LibcRw read;
+  final LibcRw write;
+  final LibcClose close;
+  final LibcFcntl fcntl;
+
+  Libc({
+    required this.socket,
+    required this.bind,
+    required this.ioctl,
+    required this.read,
+    required this.write,
+    required this.close,
+    required this.fcntl,
+  });
+
+  Libc.fromLibrary(DynamicLibrary lib)
+      : socket = lib.lookupFunction<_SocketC, LibcSocket>('socket'),
+        bind = lib.lookupFunction<_BindC, LibcBind>('bind'),
+        ioctl = lib.lookupFunction<_IoctlC, LibcIoctl>('ioctl'),
+        read = lib.lookupFunction<_RwC, LibcRw>('read'),
+        write = lib.lookupFunction<_RwC, LibcRw>('write'),
+        close = lib.lookupFunction<_CloseC, LibcClose>('close'),
+        fcntl = lib.lookupFunction<_FcntlC, LibcFcntl>('fcntl');
 }
 
-_Libc? _libc;
-_Libc get _c => _libc ??= _Libc(DynamicLibrary.process());
+Libc? _libc;
+Libc get _c => _libc ??= Libc.fromLibrary(DynamicLibrary.process());
+
+/// Replace (or, with null, restore) the libc bindings. Tests only.
+@visibleForTesting
+set libc(Libc? l) => _libc = l;
 
 class SocketCanBus implements CanBus {
   int _fd = -1;
   Timer? _poll;
   final _frames = StreamController<CanFrame>.broadcast();
   final _status = StreamController<String>.broadcast();
-  late final Pointer<Uint8> _rxBuf;
+  late Pointer<Uint8> _rxBuf;
 
   @override
   Stream<CanFrame> get frames => _frames.stream;
@@ -173,16 +197,22 @@ class SocketCanBus implements CanBus {
       if (frame != null) {
         _frames.add(frame);
       } else {
-        _status.add(describeErrorFrame(raw));
+        final what = describeErrorFrame(raw);
+        _status.add(what);
+        _frames.add(CanFrame.error(what));
       }
     }
   }
+
+  /// The iproute2 binary; a test points it at a script.
+  @visibleForTesting
+  static String ipCommand = 'ip';
 
   /// SocketCAN bitrate lives on the netdev, not the socket, so it needs
   /// CAP_NET_ADMIN. If the link is already up we leave it alone.
   Future<void> _ensureInterfaceUp(String ifname, int bitrate) async {
     try {
-      final state = await Process.run('ip', ['-details', 'link', 'show', ifname]);
+      final state = await Process.run(ipCommand, ['-details', 'link', 'show', ifname]);
       if (state.exitCode != 0) return; // let bind() produce the real error
       final out = state.stdout.toString();
       if (out.contains('state UP') || out.contains('<NOARP,UP')) {
@@ -192,11 +222,11 @@ class SocketCanBus implements CanBus {
         return;
       }
       if (ifname.startsWith('vcan')) {
-        await Process.run('ip', ['link', 'set', ifname, 'up']);
+        await Process.run(ipCommand, ['link', 'set', ifname, 'up']);
         return;
       }
       final r = await Process.run(
-          'ip', ['link', 'set', ifname, 'up', 'type', 'can', 'bitrate', '$bitrate']);
+          ipCommand, ['link', 'set', ifname, 'up', 'type', 'can', 'bitrate', '$bitrate']);
       if (r.exitCode != 0) {
         _status.add(
             'could not bring up $ifname (needs root). Run: sudo ip link set '
@@ -245,11 +275,15 @@ class SocketCanBackend implements CanBackend {
   String get unavailableReason =>
       Platform.isLinux ? '' : 'SocketCAN is a Linux kernel subsystem';
 
+  /// Where the kernel lists netdevs; a test points it at a fixture directory.
+  @visibleForTesting
+  static String sysClassNet = '/sys/class/net';
+
   @override
   Future<List<CanDevice>> discover() async {
-    if (!available) return [];
-    // Every CAN netdev shows up here, physical and virtual alike.
-    final dir = Directory('/sys/class/net');
+    // Every CAN netdev shows up here, physical and virtual alike. The
+    // directory only exists on Linux, so this doubles as the platform check.
+    final dir = Directory(sysClassNet);
     if (!dir.existsSync()) return [];
     final devices = <CanDevice>[];
     for (final e in dir.listSync()) {

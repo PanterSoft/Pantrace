@@ -15,13 +15,13 @@ void main() {
     await tester.pumpWidget(const PantraceApp());
     await tester.pumpAndSettle();
 
-    // Discovery is async; pick the demo generator once it appears.
-    await tester.tap(find.byType(DropdownButtonFormField<CanDevice>));
+    // Discovery is async; pick the demo generator for CAN1 once it appears.
+    await tester.tap(find.byType(DropdownButtonFormField<CanDevice>).first);
     await tester.pumpAndSettle();
     await tester.tap(find.text('Demo traffic generator').last);
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('Connect'));
+    await tester.tap(find.text('Connect').first);
     await tester.pump(const Duration(milliseconds: 300));
     await tester.pump(const Duration(milliseconds: 100));
 
@@ -34,7 +34,7 @@ void main() {
     // Load the DBC through the model rather than the native file dialog.
     final state = tester.state(find.byType(TracerPage)) as dynamic;
     state.model.loadDbc(
-        parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
+        0, parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
     await tester.pump(const Duration(milliseconds: 100));
 
     expect(find.text('EngineData'), findsOneWidget);
@@ -72,6 +72,40 @@ void main() {
 
     await tester.tap(find.text('Disconnect'));
     await tester.pump(const Duration(milliseconds: 100));
-    expect(find.text('Connect'), findsOneWidget);
+    expect(find.text('Connect'), findsNWidgets(2));
+  });
+
+  testWidgets('traces two buses side by side, keyed per channel', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 800));
+    await tester.pumpWidget(const PantraceApp());
+    await tester.pumpAndSettle();
+
+    for (final i in [0, 1]) {
+      await tester.tap(find.byType(DropdownButtonFormField<CanDevice>).at(i));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Demo traffic generator').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Connect').first);
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('Disconnect'), findsNWidgets(2));
+
+    // The same id on both buses is two rows, not one merged counter.
+    expect(find.text('123'), findsNWidgets(2));
+    final state = tester.state(find.byType(TracerPage)) as dynamic;
+    expect(state.model.groupedRows.map((r) => r.channel).toSet(), {0, 1});
+
+    // Sending offers a channel choice, and both channels are selectable
+    // once connected.
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    expect(find.text('CAN2'), findsWidgets);
+    await tester.tap(find.text('CAN2').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(state.model.groupedRows.where((r) => r.channel == 1 && r.id == 0x123).single.count,
+        greaterThan(0));
   });
 }

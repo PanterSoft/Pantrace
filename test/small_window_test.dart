@@ -21,29 +21,34 @@ void main() {
       // Controls that must remain reachable without a maximised window.
       for (final label in ['Connect', 'Load DBC', 'Export CSV']) {
         final finder = find.text(label);
-        expect(finder, findsOneWidget, reason: '$label missing at $size');
-        final rect = tester.getRect(finder);
-        expect(rect.right, lessThanOrEqualTo(size.width),
-            reason: '$label clipped at $size');
+        expect(finder, findsWidgets, reason: '$label missing at $size');
+        for (final e in finder.evaluate()) {
+          // find.byWidget would be ambiguous here: identical const Text
+          // widgets (one per channel) canonicalize to the same instance.
+          final box = e.renderObject as RenderBox;
+          final rect = box.localToGlobal(Offset.zero) & box.size;
+          expect(rect.right, lessThanOrEqualTo(size.width),
+              reason: '$label clipped at $size');
+        }
       }
 
       // Connecting swaps labels and icons; none of that may move the toolbar,
       // or controls get pushed onto another run and out of the window.
       Map<String, Rect> geometry() => {
             for (final l in ['Load DBC', 'Export CSV', 'Send'])
-              l: tester.getRect(find.text(l)),
+              l: tester.getRect(find.text(l).first),
           };
       final layout = geometry();
 
       // The trace table degrades to a sideways scroll rather than crushed columns.
-      await tester.tap(find.text('Connect'));
+      await tester.tap(find.text('Connect').first);
       await tester.pumpAndSettle();
       expect(tester.takeException(), isNull);
       expect(geometry(), layout, reason: 'toolbar shifted on connect at $size');
 
       final state = tester.state(find.byType(TracerPage)) as dynamic;
       state.model.loadDbc(
-          parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
+          0, parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
       await tester.pumpAndSettle();
       expect(geometry(), layout, reason: 'toolbar shifted on DBC load at $size');
     });
