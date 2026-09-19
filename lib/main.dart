@@ -227,15 +227,15 @@ class _TracerPageState extends State<TracerPage> {
     setState(() => c.bus = null);
   }
 
-  Future<void> _loadDbc() async {
+  Future<void> _loadDbc(int ch) async {
     final file = await FilePicker.pickFile(dialogTitle: 'Open DBC database');
     if (file == null) return;
     try {
       // DBCs from older tools are latin-1; allowMalformed keeps those readable.
       final text = utf8.decode(await file.readAsBytes(), allowMalformed: true);
       final db = parseDbc(text);
-      model.loadDbc(db, file.name);
-      model.addStatus('loaded ${file.name}: '
+      model.loadDbc(ch, db, file.name);
+      model.addStatus('CAN${ch + 1}: loaded ${file.name}: '
           '${db.messageCount} messages, ${db.signalCount} signals');
     } catch (e) {
       _toast('$e');
@@ -260,7 +260,7 @@ class _TracerPageState extends State<TracerPage> {
         expanded.clear();
         if (expand) {
           expanded.addAll(model.groupedRows
-              .where((r) => model.messageFor(r.id, r.extended) != null)
+              .where((r) => model.messageFor(r.channel, r.id, r.extended) != null)
               .map((r) => r.key));
         }
       });
@@ -324,11 +324,18 @@ class _TracerPageState extends State<TracerPage> {
         ]),
         PlatformMenu(label: 'File', menus: [
           PlatformMenuItem(
-            label: 'Open DBC…',
+            label: 'Open DBC for CAN1…',
             shortcut: const SingleActivator(LogicalKeyboardKey.keyO, meta: true),
-            onSelected: _loadDbc,
+            onSelected: () => _loadDbc(0),
           ),
-          PlatformMenuItem(label: 'Close DBC', onSelected: model.clearDbc),
+          PlatformMenuItem(label: 'Close DBC for CAN1',
+              onSelected: () => model.clearDbc(0)),
+          PlatformMenuItem(
+            label: 'Open DBC for CAN2…',
+            onSelected: () => _loadDbc(1),
+          ),
+          PlatformMenuItem(label: 'Close DBC for CAN2',
+              onSelected: () => model.clearDbc(1)),
           PlatformMenuItemGroup(members: [
             PlatformMenuItem(
               label: 'Export CSV…',
@@ -471,6 +478,18 @@ class _Toolbar extends StatelessWidget {
         selected: c.share != null,
         onSelected: connected ? (v) => state._setShared(ch, v) : null,
       ),
+      OutlinedButton.icon(
+        onPressed: () => state._loadDbc(ch),
+        icon: const Icon(Icons.description),
+        label: const Text('Load DBC'),
+      ),
+      IconButton(
+        tooltip: state.model.dbcs[ch] == null
+            ? 'No DBC loaded'
+            : 'Unload ${state.model.dbcPaths[ch]}',
+        onPressed: state.model.dbcs[ch] == null ? null : () => state.model.clearDbc(ch),
+        icon: const Icon(Icons.close),
+      ),
     ];
   }
 
@@ -534,18 +553,6 @@ class _Toolbar extends StatelessWidget {
             icon: const Icon(Icons.delete_sweep),
           ),
           const SizedBox(width: 12),
-          OutlinedButton.icon(
-            onPressed: state._loadDbc,
-            icon: const Icon(Icons.description),
-            label: const Text('Load DBC'),
-          ),
-          IconButton(
-            tooltip: state.model.dbc == null
-                ? 'No DBC loaded'
-                : 'Unload ${state.model.dbcPath}',
-            onPressed: state.model.dbc == null ? null : state.model.clearDbc,
-            icon: const Icon(Icons.close),
-          ),
           OutlinedButton.icon(
             onPressed: state._exportCsv,
             icon: const Icon(Icons.save_alt),
@@ -711,7 +718,7 @@ class _GroupedTable extends StatelessWidget {
     final model = state.model;
     final lines = <_Line>[];
     for (final r in model.groupedRows) {
-      final msg = model.messageFor(r.id, r.extended);
+      final msg = model.messageFor(r.channel, r.id, r.extended);
       lines.add(_MsgLine(r, msg));
       if (msg != null && state.expanded.contains(r.key)) {
         for (final sig in msg.signalsFor(r.data)) {
@@ -732,7 +739,9 @@ class _GroupedTable extends StatelessWidget {
                 tooltip: anyExpanded ? 'Collapse all' : 'Expand all',
                 visualDensity: VisualDensity.compact,
                 iconSize: 18,
-                onPressed: model.dbc == null ? null : () => state.expandAll(!anyExpanded),
+                onPressed: model.dbcs.every((d) => d == null)
+                    ? null
+                    : () => state.expandAll(!anyExpanded),
                 icon: Icon(anyExpanded ? Icons.unfold_less : Icons.unfold_more),
               ),
               _sortHeader(model, 'CH', 1, TraceSort.channel),
@@ -891,7 +900,7 @@ class _LiveTable extends StatelessWidget {
                   itemBuilder: (context, i) {
                     final f = frames[i];
                     if (f.isError) return _errorRow(f);
-                    final msg = state.model.messageFor(f.id, f.extended);
+                    final msg = state.model.messageFor(f.channel, f.id, f.extended);
                     final tx = f.direction == FrameDirection.tx;
                     return InkWell(
                       onTap: null,
@@ -987,7 +996,9 @@ class _StatusBar extends StatelessWidget {
                 _stat('IDs', '${model.groupedRows.length}'),
                 _stat('Errors', '${model.errorFrames}',
                     color: model.errorFrames > 0 ? Colors.redAccent : null),
-                if (model.dbcPath != null) _stat('DBC', model.dbcPath!),
+                for (var ch = 0; ch < TraceModel.channels; ch++)
+                  if (model.dbcPaths[ch] != null)
+                    _stat('DBC ${ch + 1}', model.dbcPaths[ch]!),
                 if (model.paused)
                   const Padding(
                     padding: EdgeInsets.only(right: 16),

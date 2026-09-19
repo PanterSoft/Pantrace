@@ -259,9 +259,9 @@ BO_ 291 EngineData: 8 ECM
 ''';
 
     test('lookup resolves a message for a traced id', () {
-      final m = TraceModel()..loadDbc(parseDbc(dbc), 'test.dbc');
-      expect(m.messageFor(291, false)!.name, 'EngineData');
-      expect(m.messageFor(292, false), isNull);
+      final m = TraceModel()..loadDbc(0, parseDbc(dbc), 'test.dbc');
+      expect(m.messageFor(0, 291, false)!.name, 'EngineData');
+      expect(m.messageFor(0, 292, false), isNull);
       m.dispose();
     });
   });

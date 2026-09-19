@@ -277,13 +277,15 @@ class SlcanBus implements CanBus {
 
   void _onData(Uint8List chunk) {
     _buffer += String.fromCharCodes(chunk);
+    final (lines, rest) = splitSlcanLines(_buffer);
+    _buffer = rest;
+    // Bound only the unterminated tail: a big chunk of complete lines (what
+    // arrives after the OS buffered serial input while we were napping) is
+    // legitimate traffic, not garbage.
     if (_buffer.length > _maxLineLength) {
       _status.add('discarding $_maxLineLength+ bytes with no line terminator');
       _buffer = '';
-      return;
     }
-    final (lines, rest) = splitSlcanLines(_buffer);
-    _buffer = rest;
     for (final line in lines) {
       if (line.codeUnitAt(0) == 7) {
         // BEL: adapter rejected the previous command or saw a bus error.

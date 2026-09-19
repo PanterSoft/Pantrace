@@ -34,7 +34,7 @@ void main() {
     // Load the DBC through the model rather than the native file dialog.
     final state = tester.state(find.byType(TracerPage)) as dynamic;
     state.model.loadDbc(
-        parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
+        0, parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
     await tester.pump(const Duration(milliseconds: 100));
 
     expect(find.text('EngineData'), findsOneWidget);

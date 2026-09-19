@@ -185,6 +185,7 @@ String _errorText(int code) {
 class PcanBus implements CanBus {
   int _channel = 0;
   Timer? _poll;
+  int _lastReadError = _errOk;
   final _frames = StreamController<CanFrame>.broadcast();
   final _status = StreamController<String>.broadcast();
   late Pointer<Uint8> _msgBuf;
@@ -226,12 +227,17 @@ class PcanBus implements CanBus {
   void _drain() {
     final p = _p;
     if (p == null || _channel == 0) return;
-    for (var i = 0; i < 512; i++) {
+    for (var i = 0; i < 4096; i++) {
       final r = p.read(_channel, _msgBuf, _tsBuf);
-      if (r == _errQrcvEmpty) return;
-      if (r != _errOk) {
+      if (r & _errQrcvEmpty != 0) return;
+      // Any other code (queue overrun, bus light/heavy) still delivers a valid
+      // message. Bailing out here throttled the drain to one frame per tick,
+      // so the queue never recovered and the tracer looked hung.
+      if (r != _errOk && r != _lastReadError) {
+        _lastReadError = r;
         _status.add(_errorText(r));
-        return;
+      } else if (r == _errOk) {
+        _lastReadError = _errOk;
       }
       final raw = Uint8List.fromList(_msgBuf.asTypedList(pcanMsgSize));
       final ts = decodePcanTimestamp(Uint8List.fromList(_tsBuf.asTypedList(8)));

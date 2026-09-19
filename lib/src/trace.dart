@@ -60,8 +60,8 @@ class TraceModel extends ChangeNotifier {
   final Map<int, TraceRow> _rows = {};
   Timer? _repaint;
 
-  DbcDatabase? dbc;
-  String? dbcPath;
+  final dbcs = List<DbcDatabase?>.filled(channels, null);
+  final dbcPaths = List<String?>.filled(channels, null);
 
   bool paused = false;
   TraceView view = TraceView.grouped;
@@ -188,19 +188,20 @@ class TraceModel extends ChangeNotifier {
     notifyListeners();
   }
 
-  void loadDbc(DbcDatabase db, String path) {
-    dbc = db;
-    dbcPath = path;
+  void loadDbc(int channel, DbcDatabase db, String path) {
+    dbcs[channel] = db;
+    dbcPaths[channel] = path;
     notifyListeners();
   }
 
-  void clearDbc() {
-    dbc = null;
-    dbcPath = null;
+  void clearDbc(int channel) {
+    dbcs[channel] = null;
+    dbcPaths[channel] = null;
     notifyListeners();
   }
 
-  DbcMessage? messageFor(int id, bool extended) => dbc?.lookup(id, extended);
+  DbcMessage? messageFor(int channel, int id, bool extended) =>
+      dbcs[channel]?.lookup(id, extended);
 
   /// Accepts an id filter of comma-separated hex ids and hex ranges,
   /// e.g. "123, 200-2FF". Empty means everything.
@@ -269,8 +270,8 @@ class TraceModel extends ChangeNotifier {
       final c = switch (sort) {
         TraceSort.channel => a.channel.compareTo(b.channel),
         TraceSort.id => _byId(a, b),
-        TraceSort.name => (messageFor(a.id, a.extended)?.name ?? '')
-            .compareTo(messageFor(b.id, b.extended)?.name ?? ''),
+        TraceSort.name => (messageFor(a.channel, a.id, a.extended)?.name ?? '')
+            .compareTo(messageFor(b.channel, b.id, b.extended)?.name ?? ''),
         TraceSort.length => a.data.length.compareTo(b.data.length),
         TraceSort.data => _byData(a, b),
         TraceSort.count => a.count.compareTo(b.count),

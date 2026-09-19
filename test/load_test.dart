@@ -113,6 +113,17 @@ void main() {
       expect(status, everyElement(contains('discarding')));
       expect(status.length, 50);
     });
+
+    test('a large chunk of complete lines (after App Nap) is not discarded',
+        () async {
+      final bus = SlcanBus();
+      final frames = <CanFrame>[];
+      bus.frames.listen(frames.add);
+      // One 4 KB serial read holding hundreds of valid frames.
+      bus.feedForTest(Uint8List.fromList(('t1238DEADBEEFDEADBEEF\r' * 300).codeUnits));
+      await Future<void>.delayed(Duration.zero);
+      expect(frames.length, 300);
+    });
   });
 
   group('PCAN drain loop under a backlog bigger than one tick', () {

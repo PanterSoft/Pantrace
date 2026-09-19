@@ -23,7 +23,10 @@ void main() {
         final finder = find.text(label);
         expect(finder, findsWidgets, reason: '$label missing at $size');
         for (final e in finder.evaluate()) {
-          final rect = tester.getRect(find.byWidget(e.widget));
+          // find.byWidget would be ambiguous here: identical const Text
+          // widgets (one per channel) canonicalize to the same instance.
+          final box = e.renderObject as RenderBox;
+          final rect = box.localToGlobal(Offset.zero) & box.size;
           expect(rect.right, lessThanOrEqualTo(size.width),
               reason: '$label clipped at $size');
         }
@@ -33,7 +36,7 @@ void main() {
       // or controls get pushed onto another run and out of the window.
       Map<String, Rect> geometry() => {
             for (final l in ['Load DBC', 'Export CSV', 'Send'])
-              l: tester.getRect(find.text(l)),
+              l: tester.getRect(find.text(l).first),
           };
       final layout = geometry();
 
@@ -45,7 +48,7 @@ void main() {
 
       final state = tester.state(find.byType(TracerPage)) as dynamic;
       state.model.loadDbc(
-          parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
+          0, parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
       await tester.pumpAndSettle();
       expect(geometry(), layout, reason: 'toolbar shifted on DBC load at $size');
     });

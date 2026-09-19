@@ -357,26 +357,26 @@ void main() {
     final TraceModel model = state.model;
 
     // Cancelled dialog: nothing happens.
-    await tester.tap(find.text('Load DBC'));
+    await tester.tap(find.text('Load DBC').first);
     await tester.pumpAndSettle();
-    expect(model.dbc, isNull);
+    expect(model.dbcs[0], isNull);
 
     picker.next = _MemFile('demo.dbc', File('example/demo.dbc').readAsBytesSync());
-    await tester.tap(find.text('Load DBC'));
+    await tester.tap(find.text('Load DBC').first);
     await tester.pumpAndSettle();
-    expect(model.dbcPath, 'demo.dbc');
+    expect(model.dbcPaths[0], 'demo.dbc');
     expect(model.statusLog.last, contains('loaded demo.dbc'));
-    expect(find.text('DBC '), findsOneWidget);
+    expect(find.text('DBC 1 '), findsOneWidget);
 
     picker.next = _MemFile('bad.dbc', utf8.encode('BO_ 291 X: 8 ECU\n SG_ broken\n'));
-    await tester.tap(find.text('Load DBC'));
+    await tester.tap(find.text('Load DBC').first);
     await tester.pumpAndSettle();
     expect(find.textContaining('DBC parse error'), findsOneWidget);
-    expect(model.dbcPath, 'demo.dbc'); // the good one stays loaded
+    expect(model.dbcPaths[0], 'demo.dbc'); // the good one stays loaded
 
     await tester.tap(find.byTooltip('Unload demo.dbc'));
     await tester.pumpAndSettle();
-    expect(model.dbc, isNull);
+    expect(model.dbcs[0], isNull);
 
     await tester.pump(const Duration(seconds: 5)); // let queued toasts expire
     model.add(frame(0x123, [1, 2, 3]));
@@ -580,12 +580,12 @@ void main() {
       expect(menus.menus.map((m) => m.label), ['Pantrace', 'File', 'Edit', 'Window', 'Help']);
 
       picker.next = _MemFile('demo.dbc', File('example/demo.dbc').readAsBytesSync());
-      menus.select('Open DBC…');
+      menus.select('Open DBC for CAN1…');
       await tester.pumpAndSettle();
-      expect(model.dbcPath, 'demo.dbc');
-      menus.select('Close DBC');
+      expect(model.dbcPaths[0], 'demo.dbc');
+      menus.select('Close DBC for CAN1');
       await tester.pumpAndSettle();
-      expect(model.dbc, isNull);
+      expect(model.dbcs[0], isNull);
 
       picker.saveTo = Uri.file('/tmp/x.csv');
       menus.select('Export CSV…');
