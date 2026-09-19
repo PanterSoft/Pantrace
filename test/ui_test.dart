@@ -573,6 +573,7 @@ void main() {
       launched.add(cmd);
       return ProcessResult(0, 0, '', '');
     };
+    os = 'macos'; // the browser command follows the OS, not the target platform
     try {
       final state = await pumpApp(tester);
       final TraceModel model = state.model;
@@ -602,6 +603,7 @@ void main() {
     } finally {
       WidgetsBinding.instance.platformMenuDelegate = original;
       debugDefaultTargetPlatformOverride = null;
+      os = Platform.operatingSystem;
       launch = realLaunch;
     }
   });

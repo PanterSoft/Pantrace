@@ -148,7 +148,12 @@ bool slcanLooksLikeReply(String reply) {
 /// Open [path], send the version query, and return (detected, version) after
 /// listening for ~300 ms. Blocking; run off the UI isolate.
 (bool, String?) probeSlcanPort(String path) {
-  final port = SerialPort(path);
+  final SerialPort port;
+  try {
+    port = SerialPort(path); // a path that is no port at all throws here
+  } catch (_) {
+    return (false, null);
+  }
   if (!port.openReadWrite()) {
     port.dispose();
     return (false, null);
@@ -192,14 +197,15 @@ class _PortInfo {
 }
 
 _PortInfo _inspect(String path) {
-  final sp = SerialPort(path);
+  SerialPort? sp;
   try {
+    sp = SerialPort(path);
     return _PortInfo(path, sp.transport, sp.vendorId, sp.productId,
         sp.productName, sp.manufacturer, sp.description);
   } catch (_) {
     return _PortInfo(path, SerialPortTransport.native, null, null, null, null, null);
   } finally {
-    sp.dispose();
+    sp?.dispose();
   }
 }
 

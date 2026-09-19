@@ -57,7 +57,9 @@ EOF
     -o "$OUT/libserialport.dylib"
   ;;
 Linux)
-  cc -shared -fPIC -O2 -w -DLIBSERIALPORT_ATBUILD -Dioctl=sp_test_ioctl \
+  # NO_PORT_METADATA: the Linux backend reads /sys/class/tty/<name>, which a
+  # pty slave has no entry in, so without it every pty fails to even open.
+  cc -shared -fPIC -O2 -w -DLIBSERIALPORT_ATBUILD -DNO_PORT_METADATA -Dioctl=sp_test_ioctl \
     -I"$PKG/linux/libserialport" -I"$SRC" "$SRC/serialport.c" "$SRC/linux.c" \
     "$SRC/linux_termios.c" "$SRC/timing.c" "$OUT/ioctl_shim.c" \
     -o "$OUT/libserialport.so"
