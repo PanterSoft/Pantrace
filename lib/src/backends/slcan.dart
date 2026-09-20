@@ -237,9 +237,16 @@ class SlcanBus implements CanBus {
           '${slcanBitrateCodes.keys.join(", ")}');
     }
 
-    final port = SerialPort(address);
+    final SerialPort port;
+    try {
+      port = SerialPort(address); // a path that is no port at all throws here
+    } catch (e) {
+      throw CanBusException('Cannot open $address: $e');
+    }
     if (!port.openReadWrite()) {
-      throw CanBusException('Cannot open $address: ${SerialPort.lastError}');
+      final error = SerialPort.lastError;
+      port.dispose();
+      throw CanBusException('Cannot open $address: $error');
     }
     // Most SLCAN adapters are USB CDC, where these settings are ignored, but
     // real RS-232 bridges (CAN232) need them.
