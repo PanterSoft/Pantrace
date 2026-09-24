@@ -1,6 +1,7 @@
 // SLCAN / Lawicel ASCII protocol over a serial port.
 // Covers CANable, CANtact, USBtin, Lawicel CAN232 and the many clones.
 import 'dart:async';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
 
@@ -8,6 +9,7 @@ import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 
 import '../can.dart';
+import '../pty.dart';
 
 // ---------------------------------------------------------------------------
 // Protocol codec — pure string<->frame, no I/O, so it is unit-tested directly.
@@ -209,12 +211,24 @@ _PortInfo _inspect(String path) {
   }
 }
 
+/// True for a pseudo-terminal (directly or via a symlink such as /tmp/slcan0):
+/// a program emulating an SLCAN adapter, which libserialport cannot open.
+bool isPtyPath(String path) {
+  try {
+    final real = File(path).resolveSymbolicLinksSync();
+    return real.startsWith('/dev/ttys') || real.startsWith('/dev/pts/');
+  } on FileSystemException {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
 class SlcanBus implements CanBus {
   SerialPort? _port;
+  Pty? _pty;
   StreamSubscription<Uint8List>? _sub;
   final _frames = StreamController<CanFrame>.broadcast();
   final _status = StreamController<String>.broadcast();
@@ -226,7 +240,7 @@ class SlcanBus implements CanBus {
   @override
   Stream<String> get status => _status.stream;
   @override
-  bool get isOpen => _port?.isOpen ?? false;
+  bool get isOpen => _pty != null || (_port?.isOpen ?? false);
 
   @override
   Future<void> open(String address, int bitrate) async {
@@ -237,6 +251,47 @@ class SlcanBus implements CanBus {
           '${slcanBitrateCodes.keys.join(", ")}');
     }
 
+    if (Platform.isWindows || !isPtyPath(address)) {
+      _openSerial(address);
+    } else {
+      try {
+        _pty = Pty.connect(address);
+      } on OSError catch (e) {
+        throw CanBusException('Cannot open $address: ${e.message}');
+      }
+    }
+
+    // Close first: an adapter left open by a crashed session ignores S/O.
+    _write('C\r');
+    await Future.delayed(const Duration(milliseconds: 50));
+    _write('$code\r');
+    await Future.delayed(const Duration(milliseconds: 20));
+    _write('Z1\r'); // request timestamps; harmless if unsupported
+    _timestamps = true;
+    await Future.delayed(const Duration(milliseconds: 20));
+    _write('O\r');
+
+    final pty = _pty;
+    if (pty != null) {
+      pty.start((b) => _onData(Uint8List.fromList(b)), onHangup: () {
+        _status.add('$address closed by the program behind it');
+        // No 'C': output nobody reads can make close() on a tty wait forever.
+        _pty = null;
+        pty.close();
+      });
+      return;
+    }
+    _sub = SerialPortReader(_port!).stream.listen(
+      _onData,
+      onError: (Object e) {
+        // Usually the adapter was unplugged; the port is dead from here on.
+        _status.add('serial error: $e');
+        close();
+      },
+    );
+  }
+
+  void _openSerial(String address) {
     final SerialPort port;
     try {
       port = SerialPort(address); // a path that is no port at all throws here
@@ -257,25 +312,6 @@ class SlcanBus implements CanBus {
       ..stopBits = 1
       ..setFlowControl(SerialPortFlowControl.none);
     _port = port;
-
-    // Close first: an adapter left open by a crashed session ignores S/O.
-    _write('C\r');
-    await Future.delayed(const Duration(milliseconds: 50));
-    _write('$code\r');
-    await Future.delayed(const Duration(milliseconds: 20));
-    _write('Z1\r'); // request timestamps; harmless if unsupported
-    _timestamps = true;
-    await Future.delayed(const Duration(milliseconds: 20));
-    _write('O\r');
-
-    _sub = SerialPortReader(port).stream.listen(
-      _onData,
-      onError: (Object e) {
-        // Usually the adapter was unplugged; the port is dead from here on.
-        _status.add('serial error: $e');
-        close();
-      },
-    );
   }
 
   /// Longest legit line is a timestamped 29-bit/8-byte frame (30 chars);
@@ -299,18 +335,22 @@ class SlcanBus implements CanBus {
       _status.add('discarding $_maxLineLength+ bytes with no line terminator');
       _buffer = '';
     }
-    for (final line in lines) {
-      if (line.codeUnitAt(0) == 7) {
-        // BEL: adapter rejected the previous command or saw a bus error.
+    for (var line in lines) {
+      // BEL: adapter rejected the previous command or saw a bus error. It
+      // comes without a CR, so it can prefix the next frame on the same line.
+      while (line.isNotEmpty && line.codeUnitAt(0) == 7) {
         _status.add('adapter reported an error (BEL)');
-        continue;
+        line = line.substring(1);
       }
+      if (line.isEmpty) continue;
       final frame = parseSlcan(line, timestamps: _timestamps);
       if (frame != null) _frames.add(frame);
     }
   }
 
   void _write(String s) {
+    final pty = _pty;
+    if (pty != null) return pty.write(s.codeUnits);
     try {
       _port?.write(Uint8List.fromList(s.codeUnits));
     } on SerialPortError catch (e) {
@@ -326,6 +366,13 @@ class SlcanBus implements CanBus {
 
   @override
   Future<void> close() async {
+    final pty = _pty;
+    if (pty != null) {
+      _write('C\r');
+      _pty = null;
+      pty.close();
+      return;
+    }
     final port = _port;
     if (port == null) return;
     _port = null;
@@ -363,12 +410,32 @@ class SlcanBackend implements CanBackend {
   @visibleForTesting
   static List<String> Function() listPorts = () => SerialPort.availablePorts;
 
+  /// Emulated adapters (e.g. a network bridge) at /tmp/slcan*. They are ptys,
+  /// which libserialport neither lists nor opens, so they are found by name.
+  @visibleForTesting
+  static List<String> Function() listVirtualPorts = () {
+    if (Platform.isWindows) return [];
+    try {
+      return [
+        for (final e in Directory('/tmp').listSync(followLinks: false))
+          if (e.uri.pathSegments.last.startsWith('slcan') && isPtyPath(e.path))
+            e.path
+      ]..sort();
+    } on FileSystemException {
+      return [];
+    }
+  };
+
   @override
   Future<List<CanDevice>> discover() async {
     final infos = listPorts().map(_inspect).toList();
+    final virtual = [
+      for (final p in listVirtualPorts()) CanDevice(id, p, 'Virtual SLCAN — $p'),
+    ];
 
     if (!probe) {
       return [
+        ...virtual,
         for (final i in infos)
           CanDevice(id, i.path,
               i.description == null || i.description!.isEmpty
@@ -379,12 +446,12 @@ class SlcanBackend implements CanBackend {
 
     final candidates =
         infos.where((i) => slcanWorthProbing(i.path, i.transport)).toList();
-    if (candidates.isEmpty) return [];
+    if (candidates.isEmpty) return virtual;
     final paths = candidates.map((i) => i.path).toList();
     // Each probe blocks up to 300 ms; keep that off the UI isolate.
     final probes = await Isolate.run(() => paths.map(probeSlcanPort).toList());
 
-    final out = <CanDevice>[];
+    final out = <CanDevice>[...virtual];
     for (var k = 0; k < candidates.length; k++) {
       final i = candidates[k];
       final (detected, version) = probes[k];

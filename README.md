@@ -80,6 +80,9 @@ the status line says what to install.
   plus known adapters by USB descriptor; Bluetooth and debug consoles are never
   probed. Toggle **All ports** for firmware that doesn't answer `V`. Bitrates
   come from the fixed S0–S8 table (10k–1M).
+- **Virtual SLCAN** — a program emulating an SLCAN adapter on a pseudo-terminal
+  is listed when it links the pty as `/tmp/slcan*` (e.g. a network-to-CAN
+  bridge). Pantrace opens it directly, since libserialport can't open ptys.
 - **Sharing a channel** — SocketCAN, Vector XL and PCAN (Windows/Linux) let
   Pantrace run next to CANoe, PCAN-View etc. on the same channel; whoever
   opened it first sets the bitrate. For everything else, see *Share* below.

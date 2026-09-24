@@ -122,4 +122,31 @@ void main() {
       SlcanBackend.listPorts = () => SerialPort.availablePorts;
     }
   });
+
+  test('a /tmp/slcan* pty is listed, opened past libserialport, and hangs up',
+      () async {
+    final link = '/tmp/slcan_pantrace_test_$pid';
+    Link(link).createSync(pty);
+    final status = <String>[];
+    final got = <CanFrame>[];
+    final bus = SlcanBus();
+    try {
+      expect(isPtyPath(link), isTrue);
+      expect(isPtyPath('/dev/cu.Bluetooth-Incoming-Port'), isFalse);
+
+      bus.frames.listen(got.add);
+      bus.status.listen(status.add);
+      await bus.open(link, 1000000);
+      adapter.inject(CanFrame(id: 0x456, data: Uint8List.fromList([0x33])));
+      await until(() => got.isNotEmpty);
+      expect(got.single.toString(), '456 [1] 33');
+
+      await share.stop(); // the bridge behind the port quits
+      await until(() => !bus.isOpen);
+      expect(status.last, contains('closed'));
+    } finally {
+      Link(link).deleteSync();
+      await bus.close();
+    }
+  });
 }

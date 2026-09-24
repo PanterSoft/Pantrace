@@ -7,5 +7,6 @@ import 'package:pantrace/src/backends/slcan.dart';
 /// drains, and it would poke at whatever adapter is plugged in.
 Future<void> testExecutable(FutureOr<void> Function() testMain) async {
   SlcanBackend.listPorts = () => [];
+  SlcanBackend.listVirtualPorts = () => [];
   await testMain();
 }
