@@ -19,7 +19,7 @@ void main() {
       expect(tester.takeException(), isNull);
 
       // Controls that must remain reachable without a maximised window.
-      for (final label in ['Connect', 'Load DBC', 'Export CSV']) {
+      for (final label in ['Connect', 'Load DBC', 'Record', 'Log files']) {
         final finder = find.text(label);
         expect(finder, findsWidgets, reason: '$label missing at $size');
         for (final e in finder.evaluate()) {
@@ -35,7 +35,7 @@ void main() {
       // Connecting swaps labels and icons; none of that may move the toolbar,
       // or controls get pushed onto another run and out of the window.
       Map<String, Rect> geometry() => {
-            for (final l in ['Load DBC', 'Export CSV', 'Send'])
+            for (final l in ['Load DBC', 'Log files', 'Send'])
               l: tester.getRect(find.text(l).first),
           };
       final layout = geometry();

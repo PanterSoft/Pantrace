@@ -5,10 +5,14 @@
 // UI is told to repaint on a fixed 20 Hz timer instead of per frame, because
 // rebuilding a table per frame is what makes naive tracers unusable under load.
 import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
 
 import 'can.dart';
 import 'dbc.dart';
+import 'log/csv.dart';
+import 'log/log.dart';
 
 /// One row of the grouped ("fixed position") view: the latest state of an id.
 class TraceRow {
@@ -43,6 +47,10 @@ class TraceRow {
 
 enum TraceView { live, grouped }
 
+/// How the live view shows time: wall clock, seconds since the measurement
+/// started, or the gap to the previous frame — CANoe's trace time modes.
+enum TimeMode { absolute, relative, delta }
+
 /// Sortable columns of the grouped view.
 enum TraceSort { channel, id, name, length, data, count, cycle }
 
@@ -56,7 +64,7 @@ class TraceModel extends ChangeNotifier {
   /// disk if you need a long capture.
   static const liveCapacity = 20000;
 
-  final List<CanFrame> _live = [];
+  final _live = ListQueue<CanFrame>();
   final Map<int, TraceRow> _rows = {};
   Timer? _repaint;
 
@@ -65,6 +73,14 @@ class TraceModel extends ChangeNotifier {
 
   bool paused = false;
   TraceView view = TraceView.grouped;
+  TimeMode timeMode = TimeMode.absolute;
+
+  /// First frame since the last [clear]; the zero of [TimeMode.relative].
+  DateTime? measurementStart;
+
+  /// Set while frames are being logged to disk. Recording sees every frame,
+  /// whatever the pause state or view filter.
+  LogRecorder? recorder;
 
   TraceSort sort = TraceSort.id;
   bool sortAscending = true;
@@ -104,25 +120,60 @@ class TraceModel extends ChangeNotifier {
       (f.extended ? 67 : 47) + 8 * f.data.length;
 
   void add(CanFrame frame) {
+    final r = recorder;
+    if (r != null) {
+      try {
+        r.write(frame);
+      } catch (e) {
+        // Disk full, drive unplugged: stop logging, keep tracing.
+        recorder = null;
+        addStatus('recording to ${r.path} stopped: $e');
+      }
+    }
     // Error frames carry no payload, so they are counted on their own and kept
     // out of the rate and bus-load figures and out of the grouped view.
-    if (frame.isError) {
-      errorFrames++;
-      if (!paused) {
-        _live.add(frame);
-        if (_live.length > liveCapacity) _live.removeAt(0);
+    if (!frame.isError) {
+      _framesSinceTick++;
+      _bitsSinceTick[frame.channel] += frameBits(frame);
+    }
+    if (paused) {
+      // Still counted; only the views are frozen.
+      if (frame.isError) {
+        errorFrames++;
+      } else {
+        totalFrames++;
       }
       return;
     }
-    totalFrames++;
-    _framesSinceTick++;
-    _bitsSinceTick[frame.channel] += frameBits(frame);
-    if (paused) return;
+    _ingest(frame);
+  }
 
-    _live.add(frame);
-    if (_live.length > liveCapacity) {
-      _live.removeRange(0, _live.length - liveCapacity);
+  /// Loads frames read from a log file into the trace (CANoe's offline mode).
+  /// They go into the views and counters, but not into the live rate, the bus
+  /// load or a running recording. Frames on channels this trace does not have
+  /// are dropped; returns how many.
+  int addOffline(Iterable<CanFrame> frames) {
+    var dropped = 0;
+    for (final f in frames) {
+      if (f.channel < 0 || f.channel >= channels) {
+        dropped++;
+        continue;
+      }
+      _ingest(f);
     }
+    notifyListeners();
+    return dropped;
+  }
+
+  void _ingest(CanFrame frame) {
+    measurementStart ??= frame.timestamp;
+    _live.addLast(frame);
+    if (_live.length > liveCapacity) _live.removeFirst();
+    if (frame.isError) {
+      errorFrames++;
+      return;
+    }
+    totalFrames++;
 
     final key = TraceRow.rowKey(frame.channel, frame.id, frame.extended);
     final existing = _rows[key];
@@ -158,8 +209,35 @@ class TraceModel extends ChangeNotifier {
     _rows.clear();
     totalFrames = 0;
     errorFrames = 0;
+    measurementStart = null;
     notifyListeners();
   }
+
+  void setTimeMode(TimeMode m) {
+    timeMode = m;
+    notifyListeners();
+  }
+
+  /// Starts logging every frame to [path]; the format follows the extension.
+  void startRecording(String path, {LogFormat format = LogFormat.blf}) {
+    recorder = LogRecorder.start(path, format: format);
+    addStatus('recording to $path (${recorder!.format.label})');
+    notifyListeners();
+  }
+
+  /// Finishes the log file. Returns the recorder that was running, if any.
+  Future<LogRecorder?> stopRecording() async {
+    final r = recorder;
+    if (r == null) return null;
+    recorder = null;
+    await r.stop();
+    addStatus('recorded ${r.frames} frames to ${r.path}');
+    notifyListeners();
+    return r;
+  }
+
+  /// Everything in the live buffer, oldest first — what an export writes.
+  List<CanFrame> get bufferedFrames => List.unmodifiable(_live);
 
   void setPaused(bool v) {
     paused = v;
@@ -231,7 +309,7 @@ class TraceModel extends ChangeNotifier {
   List<CanFrame> get liveFrames {
     final out = <CanFrame>[];
     for (var i = _live.length - 1; i >= 0; i--) {
-      final f = _live[i];
+      final f = _live.elementAt(i); // O(1) on a ListQueue
       if (f.isError || _passes(f.id, f.extended)) out.add(f);
     }
     return out;
@@ -288,22 +366,10 @@ class TraceModel extends ChangeNotifier {
 
   /// CSV of the live buffer, in chronological order.
   String toCsv() {
-    final b = StringBuffer('timestamp,channel,direction,id,extended,dlc,data\n');
-    for (final f in _live) {
-      if (f.isError) {
-        b.writeln('${f.timestamp.toIso8601String()},${f.channel + 1},'
-            'error,,,,"${f.error}"');
-        continue;
-      }
-      b.writeln('${f.timestamp.toIso8601String()},'
-          '${f.channel + 1},'
-          '${f.direction.name},'
-          '${f.idHex},'
-          '${f.extended},'
-          '${f.data.length},'
-          '${f.dataHex.replaceAll(' ', '')}');
-    }
-    return b.toString();
+    final sink = MemorySink();
+    final w = CsvWriter(sink, DateTime.now());
+    _live.forEach(w.write);
+    return utf8.decode(sink.bytes);
   }
 
   @override

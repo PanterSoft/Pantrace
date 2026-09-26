@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Log files other tools wrote, read back by the format tests.
+!test/fixtures/*.log

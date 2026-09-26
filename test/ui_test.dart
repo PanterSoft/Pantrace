@@ -13,6 +13,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:pantrace/main.dart';
 import 'package:pantrace/src/backends/slcan.dart';
 import 'package:pantrace/src/can.dart';
+import 'package:pantrace/src/dbc.dart';
+import 'package:pantrace/src/log/log.dart';
 import 'package:pantrace/src/registry.dart';
 import 'package:pantrace/src/trace.dart';
 import 'package:pantrace/src/update.dart';
@@ -151,17 +153,25 @@ class _FakeMenus extends PlatformMenuDelegate {
   @override
   bool debugUnlockDelegate(BuildContext context) => true;
 
+  /// [label] may be a path, 'Export As/CSV (.csv)…', where submenus repeat
+  /// item labels.
   void select(String label) {
-    PlatformMenuItem? find(Iterable<PlatformMenuItem> items) {
+    PlatformMenuItem? find(Iterable<PlatformMenuItem> items, String label) {
       for (final i in items) {
         if (i.label == label) return i;
-        final hit = find(i is PlatformMenuItemGroup ? i.members : i.descendants);
+        final hit = find(i is PlatformMenuItemGroup ? i.members : i.descendants, label);
         if (hit != null) return hit;
       }
       return null;
     }
 
-    final item = find(menus);
+    PlatformMenuItem? item;
+    Iterable<PlatformMenuItem> scope = menus;
+    for (final part in label.split('/')) {
+      item = find(scope, part);
+      if (item == null) break;
+      scope = item is PlatformMenu ? item.menus : const [];
+    }
     expect(item, isNotNull, reason: 'no menu item "$label"');
     item!.onSelected!();
   }
@@ -220,6 +230,18 @@ Future<void> settleNetwork(WidgetTester tester) async {
 /// expires them; drop them so the next one is not queued behind.
 void clearToasts(WidgetTester tester) =>
     tester.state<ScaffoldMessengerState>(find.byType(ScaffoldMessenger)).clearSnackBars();
+
+Finder inDialog(Finder f) => find.descendant(of: find.byType(AlertDialog), matching: f);
+
+/// Log files → Export trace as → [format].
+Future<void> exportAs(WidgetTester tester, String format) async {
+  await tester.tap(find.text('Log files'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text('Export trace as'));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(format));
+  await tester.pumpAndSettle();
+}
 
 CanFrame frame(int id, List<int> data) => CanFrame(id: id, data: Uint8List.fromList(data));
 
@@ -380,16 +402,14 @@ void main() {
 
     await tester.pump(const Duration(seconds: 5)); // let queued toasts expire
     model.add(frame(0x123, [1, 2, 3]));
-    await tester.tap(find.text('Export CSV'));
-    await tester.pumpAndSettle();
+    await exportAs(tester, 'CSV (.csv)');
     expect(picker.saved, isNotNull);
     expect(utf8.decode(picker.saved!), contains('123,false,3,010203'));
-    expect(find.textContaining('Exported to'), findsNothing); // cancelled
+    expect(find.textContaining('Exported'), findsNothing); // cancelled
 
     picker.saveTo = Uri.file('/tmp/cantrace.csv');
-    await tester.tap(find.text('Export CSV'));
-    await tester.pumpAndSettle();
-    expect(find.text('Exported to /tmp/cantrace.csv'), findsOneWidget);
+    await exportAs(tester, 'CSV (.csv)');
+    expect(find.textContaining('frames to /tmp/cantrace.csv'), findsOneWidget);
   });
 
   testWidgets('toolbar controls: bitrate, port probing, pause, clear, sort, filter',
@@ -562,6 +582,270 @@ void main() {
     }
   });
 
+  group('logging', () {
+    late Directory dir;
+    setUp(() => dir = Directory.systemTemp.createTempSync('pantrace_ui'));
+    tearDown(() => dir.deleteSync(recursive: true));
+
+    Future<void> menu(WidgetTester tester, String item) async {
+      await tester.tap(find.text('Log files'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(item));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('record, stop, and the file holds what was on the bus', (tester) async {
+      final state = await pumpApp(tester);
+      final TraceModel model = state.model;
+      await tester.tap(find.text('Connect').first);
+      await tester.pumpAndSettle();
+      final bus = fake.buses.single;
+
+      // Cancelling the file dialog records nothing.
+      await tester.tap(find.text('Record'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Vector BLF (.blf)'));
+      await tester.pumpAndSettle();
+      expect(model.recorder, isNull);
+
+      final path = '${dir.path}/rec.blf';
+      picker.saveTo = Uri.file(path);
+      await tester.tap(find.text('Record'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Vector BLF (.blf)'));
+      await tester.pumpAndSettle();
+      expect(model.recorder, isNotNull);
+      expect(find.text('Stop'), findsOneWidget);
+
+      bus.inject(frame(0x321, [1, 2]));
+      bus.inject(frame(0x322, [3]));
+      model.setPaused(true);
+      bus.inject(frame(0x323, [4]));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('● REC'), findsOneWidget);
+      expect(find.textContaining('rec.blf  3 frames'), findsOneWidget);
+
+      await tester.tap(find.text('Stop'));
+      await tester.pumpAndSettle();
+      expect(model.recorder, isNull);
+      expect(find.text('Recorded 3 frames to $path'), findsOneWidget);
+      final log = decodeLog(LogFormat.blf, File(path).readAsBytesSync());
+      expect(log.frames.map((f) => f.idHex), ['321', '322', '323']);
+    });
+
+    testWidgets('open a log into the trace, and the ways that fails', (tester) async {
+      final state = await pumpApp(tester);
+      final TraceModel model = state.model;
+
+      picker.next = _MemFile('py.asc', File('test/fixtures/py.asc').readAsBytesSync());
+      await menu(tester, 'Open log file…');
+      expect(model.totalFrames, 32);
+      expect(model.errorFrames, 1);
+      expect(model.statusLog.last, endsWith('loaded 33 frames from py.asc'));
+      clearToasts(tester);
+
+      picker.next = _MemFile('notes.txt', Uint8List(3));
+      await menu(tester, 'Open log file…');
+      expect(find.textContaining('notes.txt: unknown log format'), findsOneWidget);
+      clearToasts(tester);
+
+      picker.next = _MemFile('bad.blf', Uint8List(64));
+      await menu(tester, 'Open log file…');
+      expect(find.textContaining('Could not read bad.blf'), findsOneWidget);
+      clearToasts(tester);
+
+      // Channels this trace does not have are dropped, and said so.
+      picker.next = _MemFile('x.log', Uint8List.fromList(
+          '(1.0) can0 100#01\n(1.1) can7 100#02\n(1.2) can0 100##1AA\n'.codeUnits));
+      await menu(tester, 'Open log file…');
+      expect(model.statusLog.last,
+          endsWith('1 frames from x.log (1 unsupported records skipped, 1 frames on channels beyond CAN2)'));
+    });
+
+    testWidgets('export in any format; a typed extension wins', (tester) async {
+      final state = await pumpApp(tester);
+      final TraceModel model = state.model;
+      model.add(frame(0x123, [1, 2, 3]));
+
+      picker.saveTo = Uri.file('${dir.path}/out.blf');
+      await exportAs(tester, 'Vector BLF (.blf)');
+      expect(decodeLog(LogFormat.blf, picker.saved!).frames.single.idHex, '123');
+      expect(find.text('Exported 1 frames to ${dir.path}/out.blf'), findsOneWidget);
+      clearToasts(tester);
+
+      // Picked MF4 in the menu, but typed .asc into the dialog.
+      picker.saveTo = Uri.file('${dir.path}/typed.asc');
+      await exportAs(tester, 'ASAM MDF4 (.mf4)');
+      expect(File('${dir.path}/typed.asc').readAsStringSync(), contains('123'));
+      clearToasts(tester);
+
+      picker.saveTo = Uri.file('${dir.path}/missing/dir/x.asc');
+      await exportAs(tester, 'CSV (.csv)');
+      expect(find.textContaining('Export failed'), findsOneWidget);
+    });
+
+    testWidgets('replay a log onto the connected bus', (tester) async {
+      final state = await pumpApp(tester);
+      await tester.tap(find.text('Log files'));
+      await tester.pumpAndSettle();
+      // Nothing connected: nothing to replay onto.
+      expect(tester.widget<MenuItemButton>(find.widgetWithText(MenuItemButton, 'Replay log file…')).onPressed,
+          isNull);
+      await tester.tapAt(const Offset(700, 600)); // close the menu
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Connect').first);
+      await tester.pumpAndSettle();
+      final bus = fake.buses.single;
+      const log = '(5.0) can0 101#01\n(5.0) can1 102#02\n(5.0) can0 103#03\n(5.0) can0 20000080#0000000000000000\n';
+
+      picker.next = _MemFile('r.log', Uint8List.fromList(log.codeUnits));
+      await menu(tester, 'Replay log file…');
+      expect(find.text('Replay r.log'), findsOneWidget);
+      expect(find.text('4 frames, 0.000000 s'), findsOneWidget);
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+      expect(state.replay, isNull);
+
+      picker.next = _MemFile('r.log', Uint8List.fromList(log.codeUnits));
+      await menu(tester, 'Replay log file…');
+      // Log channel 2 has nowhere to go: CAN2 is not connected.
+      expect(find.text('Not replayed'), findsOneWidget);
+      await pick(tester, 'speed', '2.0x');
+      await tester.tap(find.text('Start'));
+      await tester.pumpAndSettle();
+      expect(bus.sent.map((f) => f.idHex), ['101', '103']);
+      expect(find.text('done  2 sent'), findsOneWidget);
+
+      // Looped, it runs until stopped from the status bar.
+      picker.next = _MemFile('r.log', Uint8List.fromList(log.codeUnits));
+      await menu(tester, 'Replay log file…');
+      await tester.tap(find.text('Loop'));
+      await tester.tap(find.text('Start'));
+      await tester.pump();
+      await tester.pump();
+      expect(state.replay.running, isTrue);
+      await tester.tap(find.byTooltip('Stop replay'));
+      await tester.pumpAndSettle();
+      expect(state.replay.running, isFalse);
+    });
+  });
+
+  testWidgets('cyclic transmit from the send dialog, managed in the list', (tester) async {
+    final state = await pumpApp(tester);
+    await tester.tap(find.text('Connect').first);
+    await tester.pumpAndSettle();
+    final bus = fake.buses.single;
+
+    await tester.tap(find.byTooltip('Cyclic transmit list'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Nothing is sent cyclically'), findsOneWidget);
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'Cycle time (ms)'), '100');
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pump();
+    expect(bus.sent.length, 1); // first one right away, not after a period
+    await tester.pumpAndSettle();
+    final n = bus.sent.length;
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(bus.sent.length, n + 2);
+    expect(find.text('1'), findsWidgets); // the badge
+
+    await tester.tap(find.byTooltip('Cyclic transmit list'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('100 ms · ${bus.sent.length} sent'), findsOneWidget);
+    await tester.tap(inDialog(find.byTooltip('Pause')));
+    await tester.pump();
+    expect(find.textContaining('stopped'), findsOneWidget);
+    await tester.tap(inDialog(find.byTooltip('Resume')));
+    await tester.pump();
+    await tester.tap(find.text('Stop all'));
+    await tester.pump();
+    expect(state.tx.running, 0);
+    await tester.tap(inDialog(find.byTooltip('Remove')));
+    await tester.pumpAndSettle();
+    expect(state.tx.jobs, isEmpty);
+    await tester.tap(find.text('Close'));
+    await tester.pumpAndSettle();
+
+    // Disconnecting stops what that channel was sending.
+    state.tx.add(0, frame(0x10, [1]), const Duration(milliseconds: 50));
+    await tester.tap(find.text('Disconnect'));
+    await tester.pumpAndSettle();
+    expect(state.tx.running, 0);
+    state.tx.jobs.clear();
+  });
+
+  testWidgets('send dialog composes a frame from DBC signal values', (tester) async {
+    final state = await pumpApp(tester);
+    final TraceModel model = state.model;
+    await tester.tap(find.text('Connect').first);
+    await tester.pumpAndSettle();
+    final bus = fake.buses.single;
+    model.loadDbc(0, parseDbc(File('example/demo.dbc').readAsStringSync()), 'demo.dbc');
+
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    await pick(tester, 'msg0', 'EngineData  (123)');
+    expect(find.widgetWithText(TextField, 'EngineSpeed [rpm]'), findsOneWidget);
+    await tester.enterText(find.widgetWithText(TextField, 'EngineSpeed [rpm]'), '1000');
+    await tester.enterText(find.widgetWithText(TextField, 'CoolantTemp [degC]'), '20');
+    await tester.enterText(find.widgetWithText(TextField, 'ThrottlePos [%]'), 'abc'); // ignored
+    await tester.pump();
+    expect(find.text('A0 0F 3C 00 00 00 00 00'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    expect(bus.sent.last.idHex, '123');
+    expect(bus.sent.last.data, [0xA0, 0x0F, 0x3C, 0, 0, 0, 0, 0]);
+
+    // Value-table names work, and typed bytes show up as signal values.
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    await pick(tester, 'msg0', 'GearStatus  (100)');
+    await tester.enterText(find.widgetWithText(TextField, 'GearState'), 'drive');
+    await tester.pump();
+    expect(find.text('03 00'), findsOneWidget);
+    await tester.enterText(find.widgetWithText(TextField, 'Data (hex bytes)'), '02 00');
+    await tester.pump();
+    expect(find.widgetWithText(TextField, '2'), findsOneWidget);
+    await pick(tester, 'msg0', 'Raw frame');
+    expect(find.widgetWithText(TextField, 'GearState'), findsNothing);
+    await tester.enterText(find.widgetWithText(TextField, 'Cycle time (ms)'), '');
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    expect(bus.sent.last.data, [2, 0]);
+  });
+
+  testWidgets('live view switches between absolute, relative and delta time', (tester) async {
+    final state = await pumpApp(tester);
+    final TraceModel model = state.model;
+    final t = DateTime(2026, 1, 1, 12);
+    model.add(CanFrame(id: 1, data: Uint8List(0), timestamp: t));
+    model.add(CanFrame(id: 2, data: Uint8List(0), timestamp: t.add(const Duration(milliseconds: 10))));
+    model.add(CanFrame.error('x', timestamp: t.add(const Duration(milliseconds: 25))));
+    await tester.tap(find.text('Live'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('12:00:00.010'), findsOneWidget);
+
+    await tester.tap(find.text('TIME ▾'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('0.010000'), findsOneWidget);
+    expect(find.text('0.025000'), findsOneWidget);
+
+    await tester.tap(find.text('TIME (s) ▾'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('+0.015000'), findsOneWidget);
+    expect(find.text('+0.000000'), findsOneWidget);
+
+    await tester.tap(find.text('Δ TIME (s) ▾'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(model.timeMode, TimeMode.absolute);
+  });
+
   testWidgets('macOS gets the menu bar instead of the overflow menu', (tester) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.macOS;
     final menus = _FakeMenus();
@@ -589,14 +873,34 @@ void main() {
       expect(model.dbcs[0], isNull);
 
       picker.saveTo = Uri.file('/tmp/x.csv');
-      menus.select('Export CSV…');
+      menus.select('Export As/CSV (.csv)…');
       await tester.pumpAndSettle();
-      expect(find.text('Exported to /tmp/x.csv'), findsOneWidget);
+      expect(find.text('Exported 0 frames to /tmp/x.csv'), findsOneWidget);
 
       menus.select('Release Notes');
       expect(launched, ['open']);
 
       await tester.pump(const Duration(seconds: 5)); // export toast gone
+
+      final tmp = Directory.systemTemp.createTempSync('pantrace_menu');
+      picker.saveTo = Uri.file('${tmp.path}/m.asc');
+      menus.select('Record As/Vector ASC (.asc)…');
+      await tester.pumpAndSettle();
+      expect(model.recorder?.format, LogFormat.asc);
+      menus.select('Stop Recording');
+      await tester.pumpAndSettle();
+      expect(model.recorder, isNull);
+      expect(File('${tmp.path}/m.asc').readAsStringSync(), contains('End TriggerBlock'));
+      tmp.deleteSync(recursive: true);
+      picker.next = _MemFile('py.log', File('test/fixtures/py.log').readAsBytesSync());
+      menus.select('Open Log File…');
+      await tester.pumpAndSettle();
+      expect(model.totalFrames, 32);
+      menus.select('Replay Log File…'); // cancelled in the file dialog
+      await tester.pumpAndSettle();
+      clearToasts(tester);
+      await tester.pumpAndSettle();
+
       menus.select('Check for Updates…');
       await tester.pumpAndSettle();
       expect(find.textContaining('Update check failed'), findsOneWidget);
