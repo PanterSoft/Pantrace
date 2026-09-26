@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:file_picker/file_picker.dart';
@@ -10,10 +11,15 @@ import 'package:flutter/services.dart';
 import 'src/backends/slcan.dart';
 import 'src/can.dart';
 import 'src/dbc.dart';
+import 'src/log/log.dart';
 import 'src/registry.dart';
 import 'src/share.dart';
 import 'src/trace.dart';
+import 'src/transmit.dart';
 import 'src/update.dart';
+
+part 'ui/logging.dart';
+part 'ui/send.dart';
 
 void main() => runApp(const PantraceApp()); // coverage:ignore-line
 
@@ -86,6 +92,9 @@ class _Channel {
   CanShare? share;
   CanDevice? device;
   int bitrate = 500000;
+
+  /// CAN FD data-phase bitrate; null runs the channel as classic CAN.
+  int? dataBitrate;
   bool connecting = false;
   bool get connected => bus != null;
 }
@@ -96,6 +105,8 @@ class _TracerPageState extends State<TracerPage> {
   List<CanDevice> devices = [];
   bool scanning = false;
   final expanded = <int>{};
+  late final tx = TxScheduler(sendFrame);
+  LogReplay? replay;
 
   @override
   void initState() {
@@ -161,12 +172,42 @@ class _TracerPageState extends State<TracerPage> {
 
   @override
   void dispose() {
+    tx.dispose();
+    replay?.dispose();
+    // Unawaited: finishing the log only patches its header and closes it.
+    model.stopRecording();
     for (final c in channels) {
       c.share?.stop();
       c.bus?.close();
     }
     model.dispose();
     super.dispose();
+  }
+
+  /// Transmits [template] on channel [ch] as a fresh, now-stamped Tx frame.
+  /// The one path every sender (dialog, cyclic list, replay) goes through.
+  Future<void> sendFrame(int ch, CanFrame template) async {
+    final c = channels[ch];
+    final bus = c.bus;
+    if (bus == null) throw CanBusException('CAN${ch + 1} is not connected');
+    checkSendable(template, fdMode: c.dataBitrate != null);
+    final frame = CanFrame(
+        id: template.id,
+        // FD payloads only come in some lengths; pad like the controller would.
+        data: template.fd && fdPaddedLength(template.data.length) != template.data.length
+            ? (Uint8List(fdPaddedLength(template.data.length))..setAll(0, template.data))
+            : template.data,
+        extended: template.extended,
+        rtr: template.rtr,
+        fd: template.fd,
+        brs: template.fd && template.brs,
+        direction: FrameDirection.tx);
+    await bus.send(frame);
+    // Drivers that do not echo transmissions still need the frame traced.
+    if (c.device?.backend != 'virtual') {
+      model.add(frame.withChannel(ch));
+      c.share?.relay(frame);
+    }
   }
 
   Future<void> _refreshDevices() async {
@@ -207,9 +248,12 @@ class _TracerPageState extends State<TracerPage> {
         // The backend closes itself when the device goes away.
         if (!b.isOpen && c.bus == b && mounted) setState(() => c.bus = null);
       });
-      await b.open(d.address, c.bitrate);
+      final fd = backendById(d.backend).supportsFd ? c.dataBitrate : null;
+      await b.open(d.address, c.bitrate, dataBitrate: fd);
       model.bitrates[ch] = c.bitrate;
-      model.addStatus('CAN${ch + 1}: connected to ${d.label} at ${c.bitrate} bit/s');
+      model.dataBitrates[ch] = fd;
+      model.addStatus('CAN${ch + 1}: connected to ${d.label} at ${c.bitrate} bit/s'
+          '${fd == null ? '' : ', CAN FD data phase $fd bit/s'}');
       setState(() => c.bus = b);
     } catch (e) {
       model.addStatus('CAN${ch + 1}: $e');
@@ -221,6 +265,7 @@ class _TracerPageState extends State<TracerPage> {
 
   Future<void> _disconnect(int ch) async {
     final c = channels[ch];
+    tx.stopAll(channel: ch);
     await _setShared(ch, false);
     await c.bus?.close();
     model.addStatus('CAN${ch + 1}: disconnected');
@@ -242,14 +287,109 @@ class _TracerPageState extends State<TracerPage> {
     }
   }
 
-  Future<void> _exportCsv() async {
+  /// Writes the trace buffer as [format]. A different known extension typed
+  /// into the save dialog wins over the menu choice.
+  Future<void> _export(LogFormat format) async {
+    final frames = model.bufferedFrames;
     final uri = await FilePicker.saveFile(
-      dialogTitle: 'Export trace as CSV',
-      fileName: 'cantrace.csv',
-      mimeType: 'text/csv',
-      bytes: utf8.encode(model.toCsv()),
+      dialogTitle: 'Export trace as ${format.label}',
+      fileName: 'cantrace.${format.extension}',
+      bytes: await encodeLog(format, frames),
     );
-    if (uri != null) _toast('Exported to ${uri.toFilePath()}');
+    if (uri == null) return;
+    final path = uri.toFilePath();
+    final typed = LogFormat.fromPath(path);
+    try {
+      if (typed != null && typed != format) {
+        File(path).writeAsBytesSync(await encodeLog(typed, frames));
+      }
+      _toast('Exported ${frames.length} frames to $path');
+    } catch (e) {
+      _toast('Export failed: $e');
+    }
+  }
+
+  static String _fileStamp(DateTime t) => t
+      .toIso8601String()
+      .substring(0, 19)
+      .replaceAll(RegExp('[-:]'), '')
+      .replaceAll('T', '-');
+
+  /// Asks for a file and streams every frame from now on into it.
+  Future<void> _startRecording(LogFormat format) async {
+    final uri = await FilePicker.saveFile(
+      dialogTitle: 'Record trace as ${format.label}',
+      fileName: 'trace-${_fileStamp(DateTime.now())}.${format.extension}',
+      bytes: Uint8List(0),
+    );
+    if (uri == null) return;
+    try {
+      model.startRecording(uri.toFilePath(), format: format);
+    } catch (e) {
+      _toast('Could not start recording: $e');
+    }
+  }
+
+  Future<void> _stopRecording() async {
+    final r = await model.stopRecording();
+    if (r != null) _toast('Recorded ${r.frames} frames to ${r.path}');
+  }
+
+  /// Picks and decodes a log file; null when cancelled or unreadable.
+  Future<(String, DecodedLog)?> _pickLog(String title) async {
+    final file = await FilePicker.pickFile(dialogTitle: title);
+    if (file == null) return null;
+    final format = LogFormat.fromPath(file.name);
+    if (format == null) {
+      _toast('${file.name}: unknown log format — open '
+          '${LogFormat.allExtensions.map((e) => '.$e').join(', ')}');
+      return null;
+    }
+    try {
+      return (file.name, await decodeLogAsync(format, await file.readAsBytes()));
+    } catch (e) {
+      _toast('Could not read ${file.name}: $e');
+      return null;
+    }
+  }
+
+  /// CANoe's offline mode: a recorded log goes into the trace views.
+  Future<void> _openLog() async {
+    final picked = await _pickLog('Open log file');
+    if (picked == null) return;
+    final (name, log) = picked;
+    final dropped = model.addOffline(log.frames);
+    final notes = [
+      if (log.skipped > 0) '${log.skipped} unsupported records skipped',
+      if (dropped > 0) '$dropped frames on channels beyond CAN${TraceModel.channels}',
+    ];
+    model.addStatus('loaded ${log.frames.length - dropped} frames from $name'
+        '${notes.isEmpty ? '' : ' (${notes.join(', ')})'}');
+    _toast('Loaded ${log.frames.length - dropped} frames from $name');
+  }
+
+  /// CANoe's replay block: a recorded log played back onto the buses.
+  Future<void> _replayLog() async {
+    final picked = await _pickLog('Replay log file');
+    if (picked == null || !mounted) return;
+    final (name, log) = picked;
+    final r = await showDialog<LogReplay>(
+        context: context,
+        builder: (_) => _ReplayDialog(state: this, name: name, log: log));
+    if (r == null || !mounted) return;
+    replay?.dispose();
+    r.addListener(() {
+      if (mounted) setState(() {});
+    });
+    setState(() => replay = r);
+    model.addStatus('replaying $name: ${r.frames.length} frames at ${r.speed}x'
+        '${r.loop ? ', looped' : ''}');
+    r.start();
+  }
+
+  void _stopReplay() {
+    replay?.stop();
+    setState(() {});
   }
 
   // The toolbar and tables live in separate widgets; these are the only
@@ -260,7 +400,7 @@ class _TracerPageState extends State<TracerPage> {
         expanded.clear();
         if (expand) {
           expanded.addAll(model.groupedRows
-              .where((r) => model.messageFor(r.channel, r.id, r.extended) != null)
+              .where((r) => _expandable(r, model.messageFor(r.channel, r.id, r.extended)))
               .map((r) => r.key));
         }
       });
@@ -285,7 +425,11 @@ class _TracerPageState extends State<TracerPage> {
     if (mounted) setState(() {});
   }
 
-  void setDevice(int ch, CanDevice? d) => setState(() => channels[ch].device = d);
+  void setDevice(int ch, CanDevice? d) => setState(() {
+        channels[ch].device = d;
+        if (d == null || !backendById(d.backend).supportsFd) channels[ch].dataBitrate = null;
+      });
+  void setDataBitrate(int ch, int? b) => setState(() => channels[ch].dataBitrate = b);
   void setBitrate(int ch, int b) => setState(() => channels[ch].bitrate = b);
   void setProbeSerial(bool v) {
     (backendById('slcan') as SlcanBackend).probe = v;
@@ -338,10 +482,36 @@ class _TracerPageState extends State<TracerPage> {
               onSelected: () => model.clearDbc(1)),
           PlatformMenuItemGroup(members: [
             PlatformMenuItem(
-              label: 'Export CSV…',
-              shortcut: const SingleActivator(LogicalKeyboardKey.keyS, meta: true),
-              onSelected: _exportCsv,
+              label: 'Open Log File…',
+              shortcut: const SingleActivator(LogicalKeyboardKey.keyO,
+                  meta: true, shift: true),
+              onSelected: _openLog,
             ),
+            PlatformMenuItem(label: 'Replay Log File…', onSelected: _replayLog),
+          ]),
+          PlatformMenuItemGroup(members: [
+            PlatformMenu(label: 'Record As', menus: [
+              for (final f in LogFormat.values)
+                PlatformMenuItem(
+                    label: '${f.label} (.${f.extension})…',
+                    onSelected: () => _startRecording(f)),
+            ]),
+            PlatformMenuItem(
+              label: 'Stop Recording',
+              shortcut: const SingleActivator(LogicalKeyboardKey.keyR,
+                  meta: true, shift: true),
+              onSelected: _stopRecording,
+            ),
+            PlatformMenu(label: 'Export As', menus: [
+              for (final f in LogFormat.values)
+                PlatformMenuItem(
+                  label: '${f.label} (.${f.extension})…',
+                  shortcut: f == LogFormat.csv
+                      ? const SingleActivator(LogicalKeyboardKey.keyS, meta: true)
+                      : null,
+                  onSelected: () => _export(f),
+                ),
+            ]),
           ]),
         ]),
         const PlatformMenu(label: 'Edit', menus: [
@@ -399,7 +569,7 @@ class _TracerPageState extends State<TracerPage> {
           const Divider(height: 1),
           ListenableBuilder(
             listenable: model,
-            builder: (context, _) => _StatusBar(model: model),
+            builder: (context, _) => _StatusBar(state: this),
           ),
         ],
       ),
@@ -420,6 +590,8 @@ class _Toolbar extends StatelessWidget {
   List<Widget> _channel(int ch, double Function(double) cap) {
     final c = state.channels[ch];
     final connected = c.connected;
+    final dev = c.device;
+    final fdCapable = dev != null && backendById(dev.backend).supportsFd;
     return [
       Text('CAN${ch + 1}',
           style: TextStyle(
@@ -455,6 +627,30 @@ class _Toolbar extends StatelessWidget {
                   child: Text('${b ~/ 1000} kbit/s', overflow: TextOverflow.ellipsis)))
               .toList(),
           onChanged: connected ? null : (b) => state.setBitrate(ch, b!),
+        ),
+      ),
+      SizedBox(
+        width: cap(110),
+        // Rebuilt when the device's FD support changes, so the field never
+        // holds a value its item list no longer has.
+        child: KeyedSubtree(
+          key: ValueKey(fdCapable),
+          child: DropdownButtonFormField<int?>(
+          key: ValueKey('mode$ch'),
+          initialValue: c.dataBitrate,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              labelText: 'Mode', border: OutlineInputBorder(), isDense: true),
+          items: [
+            const DropdownMenuItem(value: null, child: Text('CAN')),
+            if (fdCapable)
+              for (final b in kFdDataBitrates)
+                DropdownMenuItem(
+                    value: b,
+                    child: Text('FD ${b ~/ 1000000}M', overflow: TextOverflow.ellipsis)),
+          ],
+          onChanged: connected || !fdCapable ? null : (b) => state.setDataBitrate(ch, b),
+        ),
         ),
       ),
       // Fixed width: 'Disconnect' is wider than 'Connect', and letting the
@@ -553,11 +749,8 @@ class _Toolbar extends StatelessWidget {
             icon: const Icon(Icons.delete_sweep),
           ),
           const SizedBox(width: 12),
-          OutlinedButton.icon(
-            onPressed: state._exportCsv,
-            icon: const Icon(Icons.save_alt),
-            label: const Text('Export CSV'),
-          ),
+          _RecordButton(state: state),
+          _LogMenu(state: state),
           OutlinedButton.icon(
             onPressed: connected
                 ? () => showDialog(
@@ -566,6 +759,16 @@ class _Toolbar extends StatelessWidget {
                 : null,
             icon: const Icon(Icons.send),
             label: const Text('Send'),
+          ),
+          IconButton(
+            tooltip: 'Cyclic transmit list',
+            onPressed: () => showDialog(
+                context: context, builder: (_) => _TxListDialog(state: state)),
+            icon: Badge(
+              isLabelVisible: state.tx.running > 0,
+              label: Text('${state.tx.running}'),
+              child: const Icon(Icons.repeat),
+            ),
           ),
           SizedBox(
             width: cap(180),
@@ -629,17 +832,6 @@ Widget _scrollableTable(Widget table) => LayoutBuilder(
 const _headerStyle = TextStyle(
     fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF9E9E9E));
 
-Widget _header(List<(String, int)> cols) => Container(
-      color: const Color(0x22FFFFFF),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Row(
-        children: [
-          for (final (label, flex) in cols)
-            Expanded(flex: flex, child: Text(label, style: _headerStyle)),
-        ],
-      ),
-    );
-
 /// Clickable column header of the grouped table: picks the sort column, and
 /// clicking the active one flips the direction.
 Widget _sortHeader(TraceModel model, String label, int flex, TraceSort column) {
@@ -665,33 +857,48 @@ Widget _sortHeader(TraceModel model, String label, int flex, TraceSort column) {
   );
 }
 
-/// Hex payload with per-byte highlighting of what just changed.
+/// Hex payload with per-byte highlighting of what just changed. One line: a
+/// 64-byte FD payload is cut with an ellipsis (expand the row for all of it).
 class _HexData extends StatelessWidget {
   final Uint8List data;
   final int changedMask;
-  const _HexData(this.data, {this.changedMask = 0});
+  final int offset;
+  const _HexData(this.data, {this.changedMask = 0, this.offset = 0});
 
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
-    return Row(
-      children: [
+    return Text.rich(
+      TextSpan(children: [
         for (var i = 0; i < data.length; i++)
-          Padding(
-            padding: const EdgeInsets.only(right: 6),
-            child: Text(
-              data[i].toRadixString(16).toUpperCase().padLeft(2, '0'),
-              style: _mono.copyWith(
-                color: (changedMask >> i) & 1 == 1 ? accent : null,
-                fontWeight:
-                    (changedMask >> i) & 1 == 1 ? FontWeight.bold : null,
-              ),
-            ),
+          TextSpan(
+            text: '${data[i].toRadixString(16).toUpperCase().padLeft(2, '0')} ',
+            style: (changedMask >> (i + offset)) & 1 == 1
+                ? TextStyle(color: accent, fontWeight: FontWeight.bold)
+                : null,
           ),
-      ],
+      ]),
+      style: _mono,
+      maxLines: 1,
+      softWrap: false,
+      overflow: TextOverflow.ellipsis,
     );
   }
 }
+
+/// Payload length, tagged FD (and BRS) for CAN FD frames.
+Widget _lenText(int length, {bool fd = false, bool brs = false}) => Text.rich(
+      TextSpan(text: '$length', children: [
+        if (fd)
+          TextSpan(
+              text: brs ? ' FD·B' : ' FD',
+              style: const TextStyle(fontSize: 9, color: Colors.lightBlueAccent)),
+      ]),
+      style: _mono,
+      maxLines: 1,
+      softWrap: false,
+      overflow: TextOverflow.clip,
+    );
 
 /// A line in the grouped trace: either a message or, when that message is
 /// expanded and decodable, one of its signals — CANoe's trace window layout.
@@ -709,6 +916,17 @@ class _SigLine extends _Line {
   _SigLine(this.row, this.sig);
 }
 
+/// 16 bytes of a long (CAN FD) payload, shown under its expanded message.
+class _DataLine extends _Line {
+  final TraceRow row;
+  final int offset;
+  _DataLine(this.row, this.offset);
+}
+
+/// Rows that open: decodable ones, and ones whose payload is too long to
+/// read in one table cell.
+bool _expandable(TraceRow r, DbcMessage? msg) => msg != null || r.data.length > 8;
+
 class _GroupedTable extends StatelessWidget {
   final _TracerPageState state;
   const _GroupedTable({required this.state});
@@ -720,9 +938,16 @@ class _GroupedTable extends StatelessWidget {
     for (final r in model.groupedRows) {
       final msg = model.messageFor(r.channel, r.id, r.extended);
       lines.add(_MsgLine(r, msg));
-      if (msg != null && state.expanded.contains(r.key)) {
-        for (final sig in msg.signalsFor(r.data)) {
-          lines.add(_SigLine(r, sig));
+      if (state.expanded.contains(r.key)) {
+        if (msg != null) {
+          for (final sig in msg.signalsFor(r.data)) {
+            lines.add(_SigLine(r, sig));
+          }
+        }
+        if (r.data.length > 8) {
+          for (var o = 0; o < r.data.length; o += 16) {
+            lines.add(_DataLine(r, o));
+          }
         }
       }
     }
@@ -739,7 +964,9 @@ class _GroupedTable extends StatelessWidget {
                 tooltip: anyExpanded ? 'Collapse all' : 'Expand all',
                 visualDensity: VisualDensity.compact,
                 iconSize: 18,
-                onPressed: model.dbcs.every((d) => d == null)
+                onPressed: !anyExpanded &&
+                        !model.groupedRows.any((r) =>
+                            _expandable(r, model.messageFor(r.channel, r.id, r.extended)))
                     ? null
                     : () => state.expandAll(!anyExpanded),
                 icon: Icon(anyExpanded ? Icons.unfold_less : Icons.unfold_more),
@@ -763,6 +990,7 @@ class _GroupedTable extends StatelessWidget {
                   itemBuilder: (context, i) => switch (lines[i]) {
                     _MsgLine l => _messageRow(context, l),
                     _SigLine l => _signalRow(context, l),
+                    _DataLine l => _dataRow(l),
                   },
                 ),
         ),
@@ -776,8 +1004,9 @@ class _GroupedTable extends StatelessWidget {
     final theme = Theme.of(context);
     final open = state.expanded.contains(r.key);
     final period = r.periodMs;
+    final canOpen = _expandable(r, msg);
     return InkWell(
-      onTap: msg == null ? null : () => state.toggleExpanded(r.key),
+      onTap: canOpen ? () => state.toggleExpanded(r.key) : null,
       child: Container(
         color: open ? theme.colorScheme.primary.withValues(alpha: 0.08) : null,
         padding: const EdgeInsets.only(left: 4, right: 12),
@@ -785,7 +1014,7 @@ class _GroupedTable extends StatelessWidget {
           children: [
             SizedBox(
               width: 40,
-              child: msg == null
+              child: !canOpen
                   ? null
                   : Icon(open ? Icons.arrow_drop_down : Icons.arrow_right,
                       size: 20, color: theme.colorScheme.primary),
@@ -802,7 +1031,7 @@ class _GroupedTable extends StatelessWidget {
                     style: TextStyle(
                         fontSize: 13,
                         color: msg == null ? Colors.grey : theme.colorScheme.primary))),
-            Expanded(flex: 1, child: Text('${r.data.length}', style: _mono)),
+            Expanded(flex: 1, child: _lenText(r.data.length, fd: r.fd, brs: r.brs)),
             Expanded(flex: 6, child: _HexData(r.data, changedMask: r.changedMask)),
             Expanded(flex: 2, child: Text('${r.count}', style: _mono)),
             Expanded(
@@ -811,6 +1040,30 @@ class _GroupedTable extends StatelessWidget {
                     style: _mono)),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _dataRow(_DataLine l) {
+    final end = math.min(l.offset + 16, l.row.data.length);
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, right: 12),
+      child: Row(
+        children: [
+          const SizedBox(width: 40),
+          const Expanded(flex: 3, child: SizedBox()),
+          Expanded(
+              flex: 5,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 16),
+                child: Text('└ bytes ${l.offset}–${end - 1}',
+                    style: const TextStyle(fontSize: 13, color: Colors.grey)),
+              )),
+          Expanded(
+              flex: 10,
+              child: _HexData(Uint8List.sublistView(l.row.data, l.offset, end),
+                  changedMask: l.row.changedMask, offset: l.offset)),
+        ],
       ),
     );
   }
@@ -854,13 +1107,13 @@ class _GroupedTable extends StatelessWidget {
 
 /// An error frame: no id or payload to show, so the description takes over the
 /// row and the red makes it findable while scrolling past traffic.
-Widget _errorRow(CanFrame f) => Padding(
+Widget _errorRow(CanFrame f, String time) => Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12),
       child: Row(
         children: [
           Expanded(
               flex: 3,
-              child: Text(f.timestamp.toIso8601String().substring(11, 23),
+              child: Text(time,
                   style: _mono.copyWith(color: Colors.redAccent))),
           Expanded(
               flex: 1,
@@ -884,13 +1137,50 @@ class _LiveTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final frames = state.model.liveFrames;
+    final model = state.model;
+    final frames = model.liveFrames;
+    final start = model.measurementStart;
+    String time(int i) {
+      final t = frames[i].timestamp;
+      return switch (model.timeMode) {
+        TimeMode.absolute => t.toIso8601String().substring(11, 23),
+        TimeMode.relative => start == null ? '' : _seconds(t.difference(start)),
+        // Newest first: the previous frame is the next row down.
+        TimeMode.delta => i + 1 < frames.length
+            ? '+${_seconds(t.difference(frames[i + 1].timestamp))}'
+            : '+0.000000',
+      };
+    }
+
     return _scrollableTable(Column(
       children: [
-        _header(const [
-          ('TIME', 3), ('CH', 1), ('DIR', 1), ('ID', 2), ('MESSAGE', 4), ('LEN', 1),
-          ('DATA', 6),
-        ]),
+        Container(
+          color: const Color(0x22FFFFFF),
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Row(children: [
+            Expanded(
+              flex: 3,
+              child: Tooltip(
+                message: 'Switch between absolute, relative and delta time',
+                child: InkWell(
+                  onTap: () => model.setTimeMode(
+                      TimeMode.values[(model.timeMode.index + 1) % TimeMode.values.length]),
+                  child: Text(
+                      switch (model.timeMode) {
+                        TimeMode.absolute => 'TIME ▾',
+                        TimeMode.relative => 'TIME (s) ▾',
+                        TimeMode.delta => 'Δ TIME (s) ▾',
+                      },
+                      style: _headerStyle.copyWith(color: const Color(0xFFE0E0E0))),
+                ),
+              ),
+            ),
+            for (final (label, flex) in const [
+              ('CH', 1), ('DIR', 1), ('ID', 2), ('MESSAGE', 4), ('LEN', 1), ('DATA', 6),
+            ])
+              Expanded(flex: flex, child: Text(label, style: _headerStyle)),
+          ]),
+        ),
         Expanded(
           child: frames.isEmpty
               ? const _Empty('No frames yet — connect an interface.')
@@ -899,7 +1189,7 @@ class _LiveTable extends StatelessWidget {
                   itemExtent: 26,
                   itemBuilder: (context, i) {
                     final f = frames[i];
-                    if (f.isError) return _errorRow(f);
+                    if (f.isError) return _errorRow(f, time(i));
                     final msg = state.model.messageFor(f.channel, f.id, f.extended);
                     final tx = f.direction == FrameDirection.tx;
                     return InkWell(
@@ -910,10 +1200,7 @@ class _LiveTable extends StatelessWidget {
                           children: [
                             Expanded(
                                 flex: 3,
-                                child: Text(
-                                    f.timestamp
-                                        .toIso8601String()
-                                        .substring(11, 23),
+                                child: Text(time(i),
                                     style: _mono.copyWith(color: Colors.grey))),
                             Expanded(
                                 flex: 1,
@@ -939,7 +1226,7 @@ class _LiveTable extends StatelessWidget {
                                             : Theme.of(context).colorScheme.primary))),
                             Expanded(
                                 flex: 1,
-                                child: Text('${f.data.length}', style: _mono)),
+                                child: _lenText(f.data.length, fd: f.fd, brs: f.brs)),
                             Expanded(flex: 6, child: _HexData(f.data)),
                           ],
                         ),
@@ -952,6 +1239,17 @@ class _LiveTable extends StatelessWidget {
     ));
   }
 }
+
+String _seconds(Duration d) =>
+    (d.inMicroseconds / 1e6).toStringAsFixed(6);
+
+String _basename(String path) => path.split(RegExp(r'[/\\]')).last;
+
+String _size(int bytes) => bytes < 1024
+    ? '$bytes B'
+    : bytes < 1024 * 1024
+        ? '${(bytes / 1024).toStringAsFixed(1)} KB'
+        : '${(bytes / 1024 / 1024).toStringAsFixed(1)} MB';
 
 String _hexId(int id, bool extended) => id
     .toRadixString(16)
@@ -971,11 +1269,14 @@ class _Empty extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _StatusBar extends StatelessWidget {
-  final TraceModel model;
-  const _StatusBar({required this.model});
+  final _TracerPageState state;
+  const _StatusBar({required this.state});
 
   @override
   Widget build(BuildContext context) {
+    final model = state.model;
+    final rec = model.recorder;
+    final replay = state.replay;
     final last = model.statusLog.isEmpty ? '' : model.statusLog.last;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -988,6 +1289,29 @@ class _StatusBar extends StatelessWidget {
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               child: Row(children: [
+                // What is running in the background comes first, so it is
+                // never scrolled out of sight on a narrow window.
+                if (rec != null)
+                  _stat('● REC',
+                      '${_basename(rec.path)}  ${rec.frames} frames  ${_size(rec.bytes)}',
+                      color: Colors.redAccent),
+                if (replay != null) ...[
+                  _stat(
+                      'Replay',
+                      replay.running
+                          ? '${(replay.progress * 100).floor()} %  ${replay.sent} sent'
+                          : 'done  ${replay.sent} sent'
+                              '${replay.failed > 0 ? ', ${replay.failed} not sent' : ''}',
+                      color: replay.running ? Colors.lightBlueAccent : null),
+                  if (replay.running)
+                    IconButton(
+                      tooltip: 'Stop replay',
+                      visualDensity: VisualDensity.compact,
+                      iconSize: 16,
+                      onPressed: state._stopReplay,
+                      icon: const Icon(Icons.stop),
+                    ),
+                ],
                 _stat('Frames', '${model.totalFrames}'),
                 _stat('Rate', '${model.framesPerSecond.round()} /s'),
                 for (var ch = 0; ch < TraceModel.channels; ch++)
@@ -1032,123 +1356,4 @@ class _StatusBar extends StatelessWidget {
               style: _mono.copyWith(fontSize: 12, color: color)),
         ]),
       );
-}
-
-// ---------------------------------------------------------------------------
-
-class _SendDialog extends StatefulWidget {
-  final _TracerPageState state;
-  const _SendDialog({required this.state});
-  @override
-  State<_SendDialog> createState() => _SendDialogState();
-}
-
-class _SendDialogState extends State<_SendDialog> {
-  late int channel =
-      widget.state.channels.indexWhere((c) => c.connected).clamp(0, 99);
-  final idCtrl = TextEditingController(text: '123');
-  final dataCtrl = TextEditingController(text: '00 11 22 33');
-  bool extended = false;
-  bool rtr = false;
-  String? error;
-
-  /// ponytail: raw hex entry only. Signal-level composing would reuse
-  /// DbcSignal.rawInto, which is already written and tested.
-  Future<void> _send() async {
-    final id = int.tryParse(idCtrl.text.trim(), radix: 16);
-    if (id == null) return setState(() => error = 'ID must be hex');
-    if (id > (extended ? 0x1FFFFFFF : 0x7FF)) {
-      return setState(() => error = 'ID does not fit in an ${extended ? 29 : 11}-bit identifier');
-    }
-    final hex = dataCtrl.text.replaceAll(RegExp(r'[^0-9a-fA-F]'), '');
-    if (hex.length.isOdd) return setState(() => error = 'Data needs whole bytes');
-    if (hex.length > 16) return setState(() => error = 'Max 8 data bytes');
-    final data = Uint8List(hex.length ~/ 2);
-    for (var i = 0; i < data.length; i++) {
-      data[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
-    }
-    try {
-      final frame = CanFrame(
-          id: id, data: data, extended: extended, rtr: rtr,
-          direction: FrameDirection.tx);
-      final c = widget.state.channels[channel];
-      await c.bus!.send(frame);
-      // Drivers that do not echo transmissions still need the frame traced.
-      if (c.device?.backend != 'virtual') {
-        widget.state.model.add(frame.withChannel(channel));
-        c.share?.relay(frame);
-      }
-      if (mounted) Navigator.pop(context);
-    } catch (e) {
-      setState(() => error = '$e');
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Send CAN frame'),
-      content: SizedBox(
-        width: 380,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SegmentedButton<int>(
-              segments: [
-                for (final (i, c) in widget.state.channels.indexed)
-                  ButtonSegment(
-                      value: i, enabled: c.connected, label: Text('CAN${i + 1}')),
-              ],
-              selected: {channel},
-              onSelectionChanged: (s) => setState(() => channel = s.first),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: idCtrl,
-              style: _mono,
-              inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9a-fA-F]'))],
-              decoration: const InputDecoration(
-                  labelText: 'Identifier (hex)', border: OutlineInputBorder()),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: dataCtrl,
-              style: _mono,
-              decoration: const InputDecoration(
-                  labelText: 'Data (hex bytes)',
-                  hintText: 'DE AD BE EF',
-                  border: OutlineInputBorder()),
-            ),
-            const SizedBox(height: 8),
-            Row(children: [
-              Expanded(
-                child: CheckboxListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('29-bit', style: TextStyle(fontSize: 13)),
-                  value: extended,
-                  onChanged: (v) => setState(() => extended = v!),
-                ),
-              ),
-              Expanded(
-                child: CheckboxListTile(
-                  dense: true,
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('RTR', style: TextStyle(fontSize: 13)),
-                  value: rtr,
-                  onChanged: (v) => setState(() => rtr = v!),
-                ),
-              ),
-            ]),
-            if (error != null)
-              Text(error!, style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
-          ],
-        ),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-        FilledButton(onPressed: _send, child: const Text('Send')),
-      ],
-    );
-  }
 }

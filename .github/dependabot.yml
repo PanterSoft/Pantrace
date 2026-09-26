@@ -1,0 +1,9 @@
+# Keeps the CI actions and Dart packages current; one weekly PR per ecosystem.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: pub
+    directory: /
+    schedule: { interval: weekly }

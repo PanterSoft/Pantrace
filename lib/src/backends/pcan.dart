@@ -49,6 +49,55 @@ CanFrame? decodePcanMsg(Uint8List raw, {Duration? timestamp}) {
   );
 }
 
+// TPCANMsgFD: DWORD ID | BYTE type | BYTE DLC code | BYTE data[64], padded to
+// 72 bytes. The FD timestamp is a plain 64-bit microsecond count.
+const pcanMsgFdSize = 72;
+const _msgFd = 0x04, _msgBrs = 0x08, _msgEsi = 0x10;
+
+Uint8List encodePcanMsgFd(CanFrame f) {
+  final out = Uint8List(pcanMsgFdSize);
+  ByteData.view(out.buffer).setUint32(0, f.id, Endian.little);
+  var type = f.extended ? _msgExtended : _msgStandard;
+  if (f.rtr) type |= _msgRtr;
+  if (f.fd) type |= _msgFd | (f.brs ? _msgBrs : 0) | (f.esi ? _msgEsi : 0);
+  out[4] = type;
+  final n = f.data.length.clamp(0, f.fd ? 64 : 8);
+  out[5] = f.fd ? lengthToDlc(n) : n;
+  out.setRange(6, 6 + n, f.data);
+  return out;
+}
+
+CanFrame? decodePcanMsgFd(Uint8List raw, {Duration? timestamp}) {
+  if (raw.length < pcanMsgFdSize) return null;
+  final type = raw[4];
+  if (type & (_msgErrFrame | _msgStatus) != 0) return null;
+  final fd = type & _msgFd != 0;
+  final len = dlcToLength(raw[5], fd: fd);
+  return CanFrame(
+    id: ByteData.view(raw.buffer, raw.offsetInBytes, 4).getUint32(0, Endian.little),
+    data: Uint8List.fromList(raw.sublist(6, 6 + len)),
+    extended: type & _msgExtended != 0,
+    rtr: type & _msgRtr != 0,
+    fd: fd,
+    brs: type & _msgBrs != 0,
+    esi: type & _msgEsi != 0,
+    hwTimestamp: timestamp,
+  );
+}
+
+/// The TPCANBitrateFD string CAN_InitializeFD takes, for PEAK's 80 MHz clock.
+String pcanFdBitrate(int bitrate, int dataBitrate) {
+  const clock = 80000000;
+  final nom = bitTiming(clock, bitrate, maxTseg1: 256, maxTseg2: 128, maxSjw: 128);
+  final data = bitTiming(clock, dataBitrate, maxTseg1: 32, maxTseg2: 16, maxSjw: 16);
+  if (nom == null || data == null) {
+    throw CanBusException('PCAN FD cannot run $bitrate / $dataBitrate bit/s from its 80 MHz clock');
+  }
+  return 'f_clock_mhz=80, nom_brp=${nom.brp}, nom_tseg1=${nom.tseg1}, '
+      'nom_tseg2=${nom.tseg2}, nom_sjw=${nom.sjw}, data_brp=${data.brp}, '
+      'data_tseg1=${data.tseg1}, data_tseg2=${data.tseg2}, data_sjw=${data.sjw}';
+}
+
 /// TPCANTimestamp is millis | millis_overflow | micros = 8 bytes.
 Duration decodePcanTimestamp(Uint8List raw) {
   final bd = ByteData.view(raw.buffer, raw.offsetInBytes, 8);
@@ -108,6 +157,10 @@ typedef _GetValueC = Uint32 Function(Uint16, Uint8, Pointer<Uint8>, Uint32);
 typedef PcanGetValue = int Function(int, int, Pointer<Uint8>, int);
 typedef _ErrTextC = Uint32 Function(Uint32, Uint16, Pointer<Uint8>);
 typedef PcanErrText = int Function(int, int, Pointer<Uint8>);
+typedef _InitFdC = Uint32 Function(Uint16, Pointer<Utf8>);
+typedef PcanInitFd = int Function(int, Pointer<Utf8>);
+typedef _ReadFdC = Uint32 Function(Uint16, Pointer<Uint8>, Pointer<Uint64>);
+typedef PcanReadFd = int Function(int, Pointer<Uint8>, Pointer<Uint64>);
 
 /// The PCANBasic entry points as plain Dart functions, so a test can stand in
 /// for the driver without hardware.
@@ -119,7 +172,15 @@ class PcanDriver {
   final PcanGetValue getValue;
   final PcanErrText errText;
 
+  /// The FD entry points; null in a PCANBasic too old to have them.
+  final PcanInitFd? initFd;
+  final PcanReadFd? readFd;
+  final PcanWrite? writeFd;
+
   PcanDriver({
+    this.initFd,
+    this.readFd,
+    this.writeFd,
     required this.init,
     required this.uninit,
     required this.read,
@@ -134,7 +195,18 @@ class PcanDriver {
         read = lib.lookupFunction<_ReadC, PcanRead>('CAN_Read'),
         write = lib.lookupFunction<_WriteC, PcanWrite>('CAN_Write'),
         getValue = lib.lookupFunction<_GetValueC, PcanGetValue>('CAN_GetValue'),
-        errText = lib.lookupFunction<_ErrTextC, PcanErrText>('CAN_GetErrorText');
+        errText = lib.lookupFunction<_ErrTextC, PcanErrText>('CAN_GetErrorText'),
+        initFd = _optional(() => lib.lookupFunction<_InitFdC, PcanInitFd>('CAN_InitializeFD')),
+        readFd = _optional(() => lib.lookupFunction<_ReadFdC, PcanReadFd>('CAN_ReadFD')),
+        writeFd = _optional(() => lib.lookupFunction<_WriteC, PcanWrite>('CAN_WriteFD'));
+
+  static T? _optional<T>(T Function() lookup) {
+    try {
+      return lookup();
+    } on ArgumentError {
+      return null; // coverage:ignore-line
+    }
+  }
 }
 
 PcanDriver? _pcan;
@@ -184,6 +256,7 @@ String _errorText(int code) {
 
 class PcanBus implements CanBus {
   int _channel = 0;
+  bool _canFd = false;
   Timer? _poll;
   int _lastReadError = _errOk;
   final _frames = StreamController<CanFrame>.broadcast();
@@ -199,15 +272,29 @@ class PcanBus implements CanBus {
   bool get isOpen => _channel != 0;
 
   @override
-  Future<void> open(String address, int bitrate) async {
+  Future<void> open(String address, int bitrate, {int? dataBitrate}) async {
     final p = _p;
     if (p == null) throw CanBusException('PCANBasic driver library not found');
     final channel = int.parse(address);
-    final baud = pcanBaudCodes[bitrate];
-    if (baud == null) {
-      throw CanBusException('PCAN does not define a BTR pair for $bitrate bit/s');
+    final int r;
+    if (dataBitrate != null) {
+      final initFd = p.initFd;
+      if (initFd == null || p.readFd == null || p.writeFd == null) {
+        throw CanBusException('this PCANBasic has no CAN FD support — update the PEAK driver');
+      }
+      final timing = pcanFdBitrate(bitrate, dataBitrate).toNativeUtf8();
+      try {
+        r = initFd(channel, timing);
+      } finally {
+        calloc.free(timing);
+      }
+    } else {
+      final baud = pcanBaudCodes[bitrate];
+      if (baud == null) {
+        throw CanBusException('PCAN does not define a BTR pair for $bitrate bit/s');
+      }
+      r = p.init(channel, baud, 0, 0, 0);
     }
-    final r = p.init(channel, baud, 0, 0, 0);
     if (r == _errCaution) {
       // Another application already runs this channel; we join at its bitrate.
       _status.add('channel is shared with another application — '
@@ -217,7 +304,8 @@ class PcanBus implements CanBus {
     }
 
     _channel = channel;
-    _msgBuf = calloc<Uint8>(pcanMsgSize);
+    _canFd = dataBitrate != null;
+    _msgBuf = calloc<Uint8>(pcanMsgFdSize);
     _tsBuf = calloc<Uint8>(8);
     // ponytail: polled drain, same tradeoff as SocketCAN. PCANBasic can signal
     // an event handle instead — swap to that if you saturate a 1 Mbit bus.
@@ -228,7 +316,9 @@ class PcanBus implements CanBus {
     final p = _p;
     if (p == null || _channel == 0) return;
     for (var i = 0; i < 4096; i++) {
-      final r = p.read(_channel, _msgBuf, _tsBuf);
+      final r = _canFd
+          ? p.readFd!(_channel, _msgBuf, _tsBuf.cast<Uint64>())
+          : p.read(_channel, _msgBuf, _tsBuf);
       if (r & _errQrcvEmpty != 0) return;
       // Any other code (queue overrun, bus light/heavy) still delivers a valid
       // message. Bailing out here throttled the drain to one frame per tick,
@@ -239,9 +329,16 @@ class PcanBus implements CanBus {
       } else if (r == _errOk) {
         _lastReadError = _errOk;
       }
-      final raw = Uint8List.fromList(_msgBuf.asTypedList(pcanMsgSize));
-      final ts = decodePcanTimestamp(Uint8List.fromList(_tsBuf.asTypedList(8)));
-      final frame = decodePcanMsg(raw, timestamp: ts);
+      final CanFrame? frame;
+      final raw = Uint8List.fromList(
+          _msgBuf.asTypedList(_canFd ? pcanMsgFdSize : pcanMsgSize));
+      if (_canFd) {
+        final us = _tsBuf.cast<Uint64>().value;
+        frame = decodePcanMsgFd(raw, timestamp: Duration(microseconds: us));
+      } else {
+        final ts = decodePcanTimestamp(Uint8List.fromList(_tsBuf.asTypedList(8)));
+        frame = decodePcanMsg(raw, timestamp: ts);
+      }
       if (frame != null) {
         _frames.add(frame);
       } else if (raw[4] & _msgErrFrame != 0) {
@@ -258,8 +355,15 @@ class PcanBus implements CanBus {
   Future<void> send(CanFrame frame) async {
     final p = _p;
     if (p == null || _channel == 0) throw CanBusException('bus is not open');
-    _msgBuf.asTypedList(pcanMsgSize).setAll(0, encodePcanMsg(frame));
-    final r = p.write(_channel, _msgBuf);
+    checkSendable(frame, fdMode: _canFd);
+    final int r;
+    if (_canFd) {
+      _msgBuf.asTypedList(pcanMsgFdSize).setAll(0, encodePcanMsgFd(frame));
+      r = p.writeFd!(_channel, _msgBuf);
+    } else {
+      _msgBuf.asTypedList(pcanMsgSize).setAll(0, encodePcanMsg(frame));
+      r = p.write(_channel, _msgBuf);
+    }
     if (r != _errOk) throw CanBusException(_errorText(r));
   }
 
@@ -283,6 +387,8 @@ class PcanBackend implements CanBackend {
   String get name => 'PEAK PCAN (USB / PCI / LAN)';
   @override
   bool get available => _p != null;
+  @override
+  bool get supportsFd => _p?.initFd != null;
   @override
   String get unavailableReason => Platform.isMacOS
       ? 'install the MacCAN PCBUSB driver (libPCBUSB.dylib)'

@@ -150,8 +150,12 @@ void main() {
       final got = <CanFrame>[];
       bus.frames.listen(got.add);
       await bus.open('81', 500000);
-      // Enough 1ms ticks for backlog/512 drain passes, with margin.
-      await Future<void>.delayed(const Duration(milliseconds: 200));
+      // backlog/512 drain passes of 1ms ticks; a loaded CI runner stretches
+      // ticks, so wait for the drain rather than a fixed time.
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (got.length < backlog && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
       await bus.close();
       pcanDriver = null;
 

@@ -1,4 +1,10 @@
-; Built by CI: iscc /DAppVersion=1.2.3 windows\installer.iss
+; Built by CI: iscc /DAppVersion=1.2.3 /DArch=x64 windows\installer.iss
+; Arch is x64 or arm64 and picks both the Flutter build output and the
+; architectures the installer accepts.
+#ifndef Arch
+  #define Arch "x64"
+#endif
+
 [Setup]
 AppName=Pantrace
 AppVersion={#AppVersion}
@@ -7,9 +13,15 @@ AppPublisherURL=https://github.com/PanterSoft/Pantrace
 DefaultDirName={autopf}\Pantrace
 DefaultGroupName=Pantrace
 PrivilegesRequired=lowest
+#if Arch == "arm64"
+ArchitecturesAllowed=arm64
+ArchitecturesInstallIn64BitMode=arm64
+#else
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+#endif
 OutputDir=..
-OutputBaseFilename=Pantrace-windows-x64-setup
+OutputBaseFilename=Pantrace-windows-{#Arch}-setup
 Compression=lzma2
 SolidCompression=yes
 
@@ -17,7 +29,7 @@ SolidCompression=yes
 Name: desktopicon; Description: "Create a &desktop icon"; Flags: unchecked
 
 [Files]
-Source: "..\build\windows\x64\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
+Source: "..\build\windows\{#Arch}\runner\Release\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
 Name: "{group}\Pantrace"; Filename: "{app}\pantrace.exe"

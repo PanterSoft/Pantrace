@@ -19,12 +19,12 @@ const shareTcpPort = 20100;
 String slcanReply(String line, void Function(CanFrame) send) {
   if (line.isEmpty) return '\r';
   switch (line[0]) {
-    case 't' || 'T' || 'r' || 'R':
+    case 't' || 'T' || 'r' || 'R' || 'd' || 'D' || 'b' || 'B':
       final f = parseSlcan(line);
       if (f == null) return '\x07';
       send(CanFrame(
           id: f.id, data: f.data, extended: f.extended, rtr: f.rtr,
-          direction: FrameDirection.tx));
+          fd: f.fd, brs: f.brs, direction: FrameDirection.tx));
       return f.extended ? 'Z\r' : 'z\r';
     case 'V' || 'v':
       return 'V1013\r';
