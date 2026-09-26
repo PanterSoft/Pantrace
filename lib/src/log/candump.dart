@@ -23,6 +23,10 @@ class CandumpWriter extends LogWriter {
       // Class CAN_ERR_BUSERROR: the controller saw an error frame on the bus.
       frame = '${(_errFlag | _errBusError).toRadixString(16).toUpperCase().padLeft(8, '0')}'
           '#0000000000000000';
+    } else if (f.fd) {
+      // `##` then one hex digit of flags: 1 = BRS, 2 = ESI.
+      final flags = (f.brs ? 1 : 0) | (f.esi ? 2 : 0);
+      frame = '${f.idHex}##${flags.toRadixString(16)}${f.dataHex.replaceAll(' ', '')}';
     } else if (f.rtr) {
       frame = '${f.idHex}#R${f.data.isEmpty ? '' : f.data.length}';
     } else {
@@ -43,10 +47,6 @@ DecodedLog readCandump(Uint8List bytes) {
   for (final line in const LineSplitter().convert(latin1.decode(bytes))) {
     final m = _lineRe.firstMatch(line);
     if (m == null) continue;
-    if (m.group(5)!.isNotEmpty) {
-      skipped++; // `##` is CAN FD
-      continue;
-    }
     final frac = m.group(2)!.padRight(6, '0').substring(0, 6);
     final t = DateTime.fromMicrosecondsSinceEpoch(
         int.parse(m.group(1)!) * 1000000 + int.parse(frac));
@@ -68,14 +68,24 @@ DecodedLog readCandump(Uint8List bytes) {
           timestamp: t, channel: ch));
       continue;
     }
-    final payload = m.group(6)!.replaceAll('.', '');
-    if (payload.toUpperCase().startsWith('R')) {
+    var payload = m.group(6)!.replaceAll('.', '');
+    final fd = m.group(5)!.isNotEmpty;
+    var flags = 0;
+    if (fd) {
+      if (payload.isEmpty || payload.toUpperCase().startsWith('R')) {
+        skipped++;
+        continue;
+      }
+      flags = int.parse(payload[0], radix: 16);
+      payload = payload.substring(1);
+    }
+    if (!fd && payload.toUpperCase().startsWith('R')) {
       frames.add(CanFrame(
           id: id & 0x1FFFFFFF, extended: extended, rtr: true, data: Uint8List(0),
           timestamp: t, direction: dir, channel: ch));
       continue;
     }
-    if (payload.length.isOdd || payload.length > 16) {
+    if (payload.length.isOdd || payload.length > (fd ? 128 : 16)) {
       skipped++;
       continue;
     }
@@ -85,6 +95,7 @@ DecodedLog readCandump(Uint8List bytes) {
     }
     frames.add(CanFrame(
         id: id & 0x1FFFFFFF, extended: extended, data: data,
+        fd: fd, brs: flags & 1 != 0, esi: flags & 2 != 0,
         timestamp: t, direction: dir, channel: ch));
   }
   return DecodedLog(frames, skipped);

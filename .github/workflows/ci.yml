@@ -35,7 +35,7 @@ jobs:
       # platform-neutral suites — log formats, trace model, transmit, DBC, UI.
       - if: runner.os == 'Windows'
         run: >
-          flutter test test/log_test.dart test/transmit_test.dart test/trace_test.dart
+          flutter test test/log_test.dart test/fd_test.dart test/transmit_test.dart test/trace_test.dart
           test/dbc_test.dart test/app_test.dart test/small_window_test.dart
 
   # Every push to main releases. The version is the pubspec one while it has no

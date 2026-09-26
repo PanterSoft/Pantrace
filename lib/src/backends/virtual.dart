@@ -12,6 +12,7 @@ class VirtualBus implements CanBus {
   final bool generateTraffic;
   Timer? _gen;
   bool _open = false;
+  bool _fd = false;
   var _tick = 0;
   final _rng = Random(42); // fixed seed: reproducible in tests
 
@@ -25,8 +26,9 @@ class VirtualBus implements CanBus {
   bool get isOpen => _open;
 
   @override
-  Future<void> open(String address, int bitrate) async {
+  Future<void> open(String address, int bitrate, {int? dataBitrate}) async {
     _open = true;
+    _fd = dataBitrate != null;
     if (address == 'loopback' || !generateTraffic) return;
     _gen = Timer.periodic(const Duration(milliseconds: 10), (_) => _emit());
   }
@@ -60,6 +62,23 @@ class VirtualBus implements CanBus {
         ]),
       ));
     }
+    // In FD mode, a 64-byte BRS frame and a 12-byte one without BRS.
+    if (_fd && _tick % 20 == 0) {
+      _frames.add(CanFrame(
+        id: 0x300,
+        fd: true,
+        brs: true,
+        data: Uint8List.fromList(List.generate(64, (i) => (i + _tick ~/ 20) & 0xFF)),
+      ));
+    }
+    if (_fd && _tick % 50 == 0) {
+      _frames.add(CanFrame(
+        id: 0x18DAF110,
+        extended: true,
+        fd: true,
+        data: Uint8List.fromList(List.generate(12, (i) => i == 0 ? _tick ~/ 50 : 0)),
+      ));
+    }
     if (_tick % 100 == 0) {
       _frames.add(CanFrame(
         id: 0x18FE6FFE,
@@ -72,11 +91,16 @@ class VirtualBus implements CanBus {
   @override
   Future<void> send(CanFrame frame) async {
     if (!_open) throw CanBusException('bus is not open');
+    checkSendable(frame, fdMode: _fd);
     _frames.add(CanFrame(
       id: frame.id,
-      data: frame.data,
+      data: frame.fd
+          ? (Uint8List(fdPaddedLength(frame.data.length))..setAll(0, frame.data))
+          : frame.data,
       extended: frame.extended,
       rtr: frame.rtr,
+      fd: frame.fd,
+      brs: frame.brs,
       direction: FrameDirection.tx,
     ));
   }
@@ -96,6 +120,8 @@ class VirtualBackend implements CanBackend {
   String get name => 'Virtual bus (no hardware)';
   @override
   bool get available => true;
+  @override
+  bool get supportsFd => true;
   @override
   String get unavailableReason => '';
 

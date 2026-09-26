@@ -45,13 +45,24 @@ class TrcWriter extends LogWriter {
   void writeFrame(CanFrame f) {
     _n++;
     final ms = (micros(f) / 1000).toStringAsFixed(3).padLeft(13);
-    final type = f.isError ? 'ER' : f.rtr ? 'RR' : 'DT';
+    final type = f.isError
+        ? 'ER'
+        : f.fd
+            ? (f.brs ? (f.esi ? 'BI' : 'FB') : (f.esi ? 'FE' : 'FD'))
+            : f.rtr
+                ? 'RR'
+                : 'DT';
     final id = f.isError
         ? '-'
         : f.id.toRadixString(16).toUpperCase().padLeft(f.extended ? 8 : 4, '0');
     final dir = f.direction == FrameDirection.tx ? 'Tx' : 'Rx';
-    final dlc = f.isError ? 0 : f.data.length;
-    final data = f.isError || f.rtr ? '' : f.dataHex;
+    final dlc = f.isError ? 0 : f.fd ? lengthToDlc(f.data.length) : f.data.length;
+    // The DLC code implies the length, so FD payloads go out padded to it.
+    final data = f.isError || f.rtr
+        ? ''
+        : f.fd
+            ? CanFrame(id: 0, data: Uint8List(fdPaddedLength(f.data.length))..setAll(0, f.data)).dataHex
+            : f.dataHex;
     _line('${'$_n'.padLeft(7)} $ms $type ${'${f.channel + 1}'.padLeft(2)} '
             '${id.padLeft(8)} $dir -  ${'$dlc'.padRight(4)} $data'
         .trimRight());
@@ -152,11 +163,17 @@ CanFrame? _v2(List<String> t, List<String> cols, DateTime start) {
   final ch = (int.tryParse(at['B'] ?? '1') ?? 1) - 1;
   final type = at['T'] ?? 'DT';
   if (type == 'ER') return CanFrame.error('error frame', timestamp: time, channel: ch);
-  if (type != 'DT' && type != 'RR') return null; // FD, status, events
+  // FD without / with bit rate switch, with ESI, with both.
+  const fdTypes = {'FD': (false, false), 'FB': (true, false), 'FE': (false, true), 'BI': (true, true)};
+  final fdType = fdTypes[type];
+  if (type != 'DT' && type != 'RR' && fdType == null) return null; // status, events
+  final fd = fdType != null;
   final idText = at['I'] ?? '';
   final id = int.tryParse(idText, radix: 16);
-  final len = int.tryParse(at['L'] ?? at['l'] ?? '');
-  if (id == null || len == null || len > 8) return null;
+  // L is the DLC code, l (version 2.0) the byte count.
+  final dlc = int.tryParse(at['L'] ?? '');
+  final len = at['l'] != null ? int.tryParse(at['l']!) : (dlc == null ? null : dlcToLength(dlc, fd: fd));
+  if (id == null || len == null || len > (fd ? 64 : 8)) return null;
   final rtr = type == 'RR';
   final data = rtr ? Uint8List(0) : _hexBytes(t.sublist(dataFrom.clamp(0, t.length)), len);
   if (data == null) return null;
@@ -164,6 +181,9 @@ CanFrame? _v2(List<String> t, List<String> cols, DateTime start) {
     id: id,
     extended: idText.length > 4,
     rtr: rtr,
+    fd: fd,
+    brs: fdType?.$1 ?? false,
+    esi: fdType?.$2 ?? false,
     data: data,
     timestamp: time,
     direction: at['d'] == 'Tx' ? FrameDirection.tx : FrameDirection.rx,

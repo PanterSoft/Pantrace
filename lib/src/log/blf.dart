@@ -25,6 +25,10 @@ const _canFdMessage = 100;
 const _canFdMessage64 = 101;
 
 const _extFlag = 0x80000000;
+// CAN_FD_MESSAGE_64 flags
+const _fd64Edl = 0x1000, _fd64Brs = 0x2000, _fd64Esi = 0x4000, _fd64Rtr = 0x0010;
+// CAN_FD_MESSAGE fd_flags
+const _fdEdl = 0x1, _fdBrs = 0x2, _fdEsi = 0x4;
 const _txFlag = 0x01;
 const _remoteFlag = 0x80;
 const _timeTenMics = 1;
@@ -120,6 +124,28 @@ class BlfWriter extends LogWriter {
       _object(_canErrorExt, w.take(), ns);
       return;
     }
+    if (f.fd) {
+      // CAN_FD_MESSAGE_64, what CANoe writes: channel, dlc, valid bytes, tx
+      // count, id, frame length, flags, two bit-timing configs, BRS and CRC
+      // time offsets, bit count, direction, ext data offset, crc — then data.
+      final n = f.data.length.clamp(0, 64);
+      final w = LeWriter()
+        ..u8(ch)
+        ..u8(lengthToDlc(n))
+        ..u8(n)
+        ..u8(0)
+        ..u32(f.id | (f.extended ? _extFlag : 0))
+        ..u32(0)
+        ..u32(_fd64Edl | (f.brs ? _fd64Brs : 0) | (f.esi ? _fd64Esi : 0))
+        ..zeros(16)
+        ..u16(0)
+        ..u8(f.direction == FrameDirection.tx ? 1 : 0)
+        ..u8(0)
+        ..u32(0)
+        ..bytes(f.data.sublist(0, n));
+      _object(_canFdMessage64, w.take(), ns);
+      return;
+    }
     final data = Uint8List(8)..setRange(0, f.data.length.clamp(0, 8), f.data);
     final w = LeWriter()
       ..u16(ch)
@@ -161,8 +187,8 @@ class BlfWriter extends LogWriter {
   }
 }
 
-/// Reads a BLF. Supports compressed and uncompressed containers and bare
-/// top-level objects; CAN FD frames are counted as skipped.
+/// Reads a BLF. Supports compressed and uncompressed containers, bare
+/// top-level objects, and classic as well as CAN FD messages.
 DecodedLog readBlf(Uint8List bytes) {
   if (bytes.length < 48 || String.fromCharCodes(bytes.sublist(0, 4)) != 'LOGG') {
     throw LogFormatException('Not a BLF file (no LOGG signature)');
@@ -206,8 +232,54 @@ DecodedLog readBlf(Uint8List bytes) {
       case _canError || _canErrorExt:
         final ch = o.getUint16(p, Endian.little) - 1;
         frames.add(CanFrame.error('error frame', timestamp: t, channel: ch < 0 ? 0 : ch));
-      case _canFdMessage || _canFdMessage64:
-        skipped++;
+      case _canFdMessage:
+        // channel u16, flags u8, dlc u8, id u32, frame length u32, bit count
+        // u8, fd flags u8, valid bytes u8, 5 reserved, data[64]
+        final ch = o.getUint16(p, Endian.little) - 1;
+        final fl = o.getUint8(p + 2);
+        final id = o.getUint32(p + 4, Endian.little);
+        final fdFlags = o.getUint8(p + 13);
+        final fd = fdFlags & _fdEdl != 0;
+        final n = o.getUint8(p + 14).clamp(0, fd ? 64 : 8);
+        final rtr = fl & _remoteFlag != 0;
+        frames.add(CanFrame(
+          id: id & 0x1FFFFFFF,
+          extended: id & _extFlag != 0,
+          rtr: rtr,
+          fd: fd,
+          brs: fdFlags & _fdBrs != 0,
+          esi: fdFlags & _fdEsi != 0,
+          data: rtr ? Uint8List(0) : Uint8List.fromList(o.buffer.asUint8List(o.offsetInBytes + p + 20, n)),
+          timestamp: t,
+          direction: fl & _txFlag != 0 ? FrameDirection.tx : FrameDirection.rx,
+          channel: ch < 0 ? 0 : ch,
+        ));
+      case _canFdMessage64:
+        final ch = o.getUint8(p) - 1;
+        final id = o.getUint32(p + 4, Endian.little);
+        final fl = o.getUint32(p + 12, Endian.little);
+        final fd = fl & _fd64Edl != 0;
+        final valid = o.getUint8(p + 2).clamp(0, fd ? 64 : 8);
+        final extOffset = o.getUint8(p + 35);
+        final objSize = o.getUint32(pos + 8, Endian.little);
+        // Data may be shorter than valid bytes; CANoe pads with zeros.
+        final avail = (extOffset != 0 ? extOffset : objSize) - headerLen - 40;
+        final n = avail < valid ? (avail < 0 ? 0 : avail) : valid;
+        final data = Uint8List(valid)
+          ..setRange(0, n, o.buffer.asUint8List(o.offsetInBytes + p + 40, n));
+        final rtr = fl & _fd64Rtr != 0;
+        frames.add(CanFrame(
+          id: id & 0x1FFFFFFF,
+          extended: id & _extFlag != 0,
+          rtr: rtr,
+          fd: fd,
+          brs: fl & _fd64Brs != 0,
+          esi: fl & _fd64Esi != 0,
+          data: rtr ? Uint8List(0) : data,
+          timestamp: t,
+          direction: o.getUint8(p + 34) != 0 ? FrameDirection.tx : FrameDirection.rx,
+          channel: ch < 0 ? 0 : ch,
+        ));
     }
   }
 

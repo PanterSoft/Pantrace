@@ -33,7 +33,7 @@ final sample = <CanFrame>[
 String describe(CanFrame f, {bool keepRtr = true}) => f.isError
     ? 'ch${f.channel} error'
     : 'ch${f.channel} ${f.direction.name} ${f.extended ? 'x' : ''}${f.idHex}'
-        '${keepRtr && f.rtr ? ' rtr' : ''} [${f.dataHex}]';
+        '${keepRtr && f.rtr ? ' rtr' : ''}${f.fd ? ' ${f.fdLabel.toLowerCase()}' : ''} [${f.dataHex}]';
 
 void main() {
   group('LogFormat', () {
@@ -207,9 +207,14 @@ Begin Triggerblock
 End TriggerBlock
 ''';
       final log = decodeLog(LogFormat.asc, b(utf8.encode(text)));
-      expect(log.frames.map(describe), ['ch0 rx 123 [01 FF]', 'ch1 tx 123 [10]']);
+      expect(log.frames.map(describe), [
+        'ch0 rx 123 [01 FF]',
+        'ch1 tx 123 [10]',
+        'ch0 rx 07B fd brs [0B 16 21 2C 37 42 4D 58]', // decimal base applies to FD too
+      ]);
       expect(log.frames[1].timestamp, DateTime(2026, 9, 26, 14, 30, 0, 750));
-      expect(log.skipped, 2); // the FD frame and the unreadable payload
+      expect(log.frames[2].timestamp, DateTime(2026, 9, 26, 14, 30, 0, 850));
+      expect(log.skipped, 1); // the unreadable payload
     });
   });
 
@@ -264,9 +269,10 @@ End TriggerBlock
 not a frame
 ''';
       final log = decodeLog(LogFormat.candump, b(utf8.encode(text)));
-      expect(log.frames.map(describe), ['ch3 tx 123 [11 22]', 'ch0 rx 7FF rtr []', 'ch0 error']);
+      expect(log.frames.map(describe),
+          ['ch3 tx 123 [11 22]', 'ch0 rx 7FF rtr []', 'ch1 rx 100 fd brs [AA BB]', 'ch0 error']);
       expect(log.frames.first.timestamp.microsecondsSinceEpoch, 1700000000500000);
-      expect(log.skipped, 2);
+      expect(log.skipped, 1);
     });
   });
 

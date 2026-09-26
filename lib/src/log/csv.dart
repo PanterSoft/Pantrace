@@ -1,15 +1,18 @@
 // Pantrace's flat CSV: one row per frame, spreadsheet-friendly.
 //
-//   timestamp,channel,direction,id,extended,dlc,data
-//   2026-09-26T09:30:00.123456,1,rx,123,false,3,010203
+//   timestamp,channel,direction,id,extended,dlc,data,flags
+//   2026-09-26T09:30:00.123456,1,rx,123,false,3,010203,
+//   2026-09-26T09:30:00.150000,1,rx,300,false,12,00112233445566778899AABB,FD BRS
 //   2026-09-26T09:30:00.200000,1,error,,,,"bus off"
+//
+// dlc is the payload length in bytes. flags lists RTR, FD, BRS and ESI.
 import 'dart:convert';
 import 'dart:typed_data';
 
 import '../can.dart';
 import 'log.dart';
 
-const csvHeader = 'timestamp,channel,direction,id,extended,dlc,data';
+const csvHeader = 'timestamp,channel,direction,id,extended,dlc,data,flags';
 
 class CsvWriter extends LogWriter {
   CsvWriter(super.sink, super.start) {
@@ -22,7 +25,8 @@ class CsvWriter extends LogWriter {
     final line = f.isError
         ? '$t,${f.channel + 1},error,,,,"${f.error!.replaceAll('"', '""')}"'
         : '$t,${f.channel + 1},${f.direction.name},${f.idHex},${f.extended},'
-            '${f.data.length},${f.dataHex.replaceAll(' ', '')}';
+            '${f.data.length},${f.dataHex.replaceAll(' ', '')},'
+            '${[if (f.rtr) 'RTR', if (f.fd) f.fdLabel].join(' ')}';
     sink.add(utf8.encode('$line\n'));
   }
 }
@@ -52,8 +56,10 @@ DecodedLog readCsv(Uint8List bytes) {
       continue;
     }
     final id = int.tryParse(c[3], radix: 16);
+    final flags = c.length > 7 ? c[7].trim().split(' ') : const <String>[];
+    final fd = flags.contains('FD');
     final hex = c[6].trim();
-    if (id == null || hex.length.isOdd || hex.length > 16 ||
+    if (id == null || hex.length.isOdd || hex.length > (fd ? 128 : 16) ||
         !RegExp(r'^[0-9A-Fa-f]*$').hasMatch(hex)) {
       skipped++;
       continue;
@@ -65,6 +71,10 @@ DecodedLog readCsv(Uint8List bytes) {
     frames.add(CanFrame(
       id: id,
       extended: c[4] == 'true',
+      rtr: flags.contains('RTR'),
+      fd: fd,
+      brs: flags.contains('BRS'),
+      esi: flags.contains('ESI'),
       data: data,
       timestamp: t,
       direction: c[2] == 'tx' ? FrameDirection.tx : FrameDirection.rx,

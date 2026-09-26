@@ -14,6 +14,11 @@ back. One Flutter codebase, no native plugin code.
 
 ## Features
 
+- **CAN FD** — per channel, pick *CAN* or an FD data bitrate (1–8 Mbit/s);
+  up to 64-byte payloads, BRS and ESI shown in the trace, sent from the Send
+  dialog, recorded, replayed and exported in every log format. Long payloads
+  open into 16-byte lines in the grouped view; bus load accounts for the
+  faster data phase
 - **Two channels** — CAN1 and CAN2 on independent interfaces and bitrates,
   traced side by side with a CH column; the same id on both buses lands on
   adjacent rows, so gateway forwarding is easy to compare
@@ -42,7 +47,8 @@ back. One Flutter codebase, no native plugin code.
   python-can, SavvyCAN, cangaroo or `slcand` use it alongside Pantrace:
   `socket://127.0.0.1:20100` on every OS, plus a virtual serial port
   (`/dev/ttys…`, shown in the status line) on macOS and Linux. Frames go both
-  ways; the bitrate stays Pantrace's.
+  ways; the bitrate stays Pantrace's. FD frames use the CANable 2.0 SLCAN
+  extension, so FD-aware clients get them intact.
 
 ## Install
 
@@ -73,13 +79,13 @@ No hardware? Pick **Demo traffic generator**, hit Connect, then **Load DBC** →
 
 ## Hardware
 
-| Backend | Devices | OS | Bound via |
-| --- | --- | --- | --- |
-| SLCAN | CANable, CANtact, USBtin, Lawicel CAN232, most cheap USB-CAN sticks | all | libserialport, bundled |
-| SocketCAN | any Linux CAN driver, `vcan`, gs_usb, PEAK, Kvaser… | Linux | `dart:ffi` → libc |
-| PCAN | PCAN-USB, -PCI, -LAN | all | `dart:ffi` → `PCANBasic.dll` / `libpcanbasic.so` / `libPCBUSB.dylib` |
-| Vector XL | VN1610/1630, CANcaseXL, VN8900… | Windows | `dart:ffi` → `vxlapi64.dll` |
-| Virtual | demo generator, loopback | all | — |
+| Backend | Devices | OS | CAN FD | Bound via |
+| --- | --- | --- | --- | --- |
+| SLCAN | CANable, CANtact, USBtin, Lawicel CAN232, most cheap USB-CAN sticks | all | CANable 2.0 FD firmware | libserialport, bundled |
+| SocketCAN | any Linux CAN driver, `vcan`, gs_usb, PEAK, Kvaser… | Linux | FD-capable drivers | `dart:ffi` → libc |
+| PCAN | PCAN-USB, -PCI, -LAN (FD models for FD) | all | PCAN-USB FD, -PCIe FD… | `dart:ffi` → `PCANBasic.dll` / `libpcanbasic.so` / `libPCBUSB.dylib` |
+| Vector XL | VN1610/1630, CANcaseXL, VN8900… | Windows | VN16xx and other FD channels | `dart:ffi` → `vxlapi64.dll` |
+| Virtual | demo generator, loopback | all | yes (demo sends FD frames) | — |
 
 Vendor backends bind to the driver the vendor already installs — nothing to
 compile. A missing driver library just means that backend lists no devices, and
@@ -103,6 +109,14 @@ the status line says what to install.
 - **Virtual SLCAN** — a program emulating an SLCAN adapter on a pseudo-terminal
   is listed when it links the pty as `/tmp/slcan*` (e.g. a network-to-CAN
   bridge). Pantrace opens it directly, since libserialport can't open ptys.
+- **CAN FD** — SocketCAN brings a down link up with
+  `ip link set canX up type can bitrate N dbitrate M fd on` and enables FD
+  frames on its socket. PCAN and Vector compute the bit timing for their 80 MHz
+  FD clocks (sample point ~80 %); PCAN needs a PCANBasic with the FD API,
+  Vector the XL driver's v4 event API. SLCAN FD follows the CANable 2.0
+  firmware: `d`/`D` FD frames, `b`/`B` with bit rate switch, `Y1`–`Y8` data
+  bitrate; classic SLCAN firmware ignores it. The Vector and PCAN FD paths are
+  unit-tested against their documented struct layouts, not yet on hardware.
 - **Sharing a channel** — SocketCAN, Vector XL and PCAN (Windows/Linux) let
   Pantrace run next to CANoe, PCAN-View etc. on the same channel; whoever
   opened it first sets the bitrate. For everything else, see *Share* below.
@@ -120,11 +134,12 @@ make build    # release bundle into build/<os>/
 Linux also needs `ninja-build libgtk-3-dev`. Packages from a Linux build:
 `linux/package-deb.sh <version> [x64|arm64]` and `linux/package-rpm.sh …`.
 
-Not here yet: CAN FD, signal graphing.
+Not here yet: signal graphing.
 
 ## Log formats
 
-Read and written, checked against python-can and asammdf in both directions:
+Read and written, classic CAN and CAN FD, checked against python-can and
+asammdf in both directions:
 
 | Format | Extension | Written by / read by |
 | --- | --- | --- |

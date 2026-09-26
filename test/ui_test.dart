@@ -35,9 +35,11 @@ class _FakeBus implements CanBus {
   Stream<String> get status => _status.stream;
   @override
   bool get isOpen => _open;
+  int? dataBitrate;
   @override
-  Future<void> open(String address, int bitrate) async {
+  Future<void> open(String address, int bitrate, {int? dataBitrate}) async {
     if (failOpen) throw CanBusException('device unplugged');
+    this.dataBitrate = dataBitrate;
     _open = true;
   }
 
@@ -68,6 +70,8 @@ class _FakeBackend implements CanBackend {
   String get name => 'Fake adapter';
   @override
   bool get available => true;
+  @override
+  bool get supportsFd => true;
   @override
   String get unavailableReason => '';
   @override
@@ -656,10 +660,10 @@ void main() {
 
       // Channels this trace does not have are dropped, and said so.
       picker.next = _MemFile('x.log', Uint8List.fromList(
-          '(1.0) can0 100#01\n(1.1) can7 100#02\n(1.2) can0 100##1AA\n'.codeUnits));
+          '(1.0) can0 100#01\n(1.1) can7 100#02\n(1.2) can0 100##1AA\n(1.3) can0 1#ABC\n'.codeUnits));
       await menu(tester, 'Open log file…');
       expect(model.statusLog.last,
-          endsWith('1 frames from x.log (1 unsupported records skipped, 1 frames on channels beyond CAN2)'));
+          endsWith('2 frames from x.log (1 unsupported records skipped, 1 frames on channels beyond CAN2)'));
     });
 
     testWidgets('export in any format; a typed extension wins', (tester) async {
@@ -818,6 +822,95 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, 'Send'));
     await tester.pumpAndSettle();
     expect(bus.sent.last.data, [2, 0]);
+  });
+
+  testWidgets('CAN FD: pick a mode, connect, send, and read long payloads', (tester) async {
+    final state = await pumpApp(tester);
+    final TraceModel model = state.model;
+
+    await pick(tester, 'mode0', 'FD 2M');
+    await tester.tap(find.text('Connect').first);
+    await tester.pumpAndSettle();
+    final bus = fake.buses.single;
+    expect(bus.dataBitrate, 2000000);
+    expect(model.dataBitrates[0], 2000000);
+    expect(model.statusLog.last, endsWith('CAN FD data phase 2000000 bit/s'));
+
+    // FD is preselected on an FD channel; 13 bytes go out padded to 16.
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'Data (hex bytes)'),
+        List.generate(13, (i) => '0${i % 10}').join(' '));
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    final f = bus.sent.single;
+    expect((f.fd, f.brs, f.data.length), (true, true, 16));
+
+    // No remote frames in FD, no more than 64 bytes.
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    expect(tester.widget<CheckboxListTile>(find.widgetWithText(CheckboxListTile, 'RTR')).onChanged,
+        isNull);
+    await tester.enterText(find.widgetWithText(TextField, 'Data (hex bytes)'), '00' * 65);
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    expect(find.text('Max 64 data bytes'), findsOneWidget);
+    await tester.tap(find.text('BRS'));
+    await tester.enterText(find.widgetWithText(TextField, 'Data (hex bytes)'), '11' * 64);
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    expect((bus.sent.last.brs, bus.sent.last.data.length), (false, 64));
+
+    // The grouped view tags FD rows and opens long payloads into byte lines.
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.textContaining('FD'), findsWidgets);
+    await tester.tap(find.text('123'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('└ bytes 0–15'), findsOneWidget);
+    expect(find.text('└ bytes 48–63'), findsOneWidget);
+    await tester.tap(find.byTooltip('Collapse all'));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(find.byTooltip('Expand all'));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('└ bytes 0–15'), findsOneWidget);
+  });
+
+  testWidgets('CAN FD needs an FD channel; FD DBC messages preselect it', (tester) async {
+    final state = await pumpApp(tester);
+    final TraceModel model = state.model;
+    await tester.tap(find.text('Connect').first); // classic CAN
+    await tester.pumpAndSettle();
+    final bus = fake.buses.single;
+    expect(bus.dataBitrate, isNull);
+    model.loadDbc(0, parseDbc('BO_ 768 Big: 16 ECU\n SG_ S : 0|8@1+ (1,0) [0|255] "" X\n'),
+        'fd.dbc');
+
+    await tester.tap(find.text('Send'));
+    await tester.pumpAndSettle();
+    await pick(tester, 'msg0', 'Big  (300)');
+    expect(tester.widget<CheckboxListTile>(find.widgetWithText(CheckboxListTile, 'CAN FD')).value,
+        isTrue);
+    await tester.enterText(find.widgetWithText(TextField, 'S'), '9');
+    await tester.pump();
+    expect(find.text('09 ${List.filled(15, '00').join(' ')}'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('runs classic CAN'), findsOneWidget);
+    expect(bus.sent, isEmpty);
+
+    // Classic again: 16 bytes are too many for a classic frame.
+    await tester.tap(find.text('CAN FD'));
+    await tester.tap(find.widgetWithText(FilledButton, 'Send'));
+    await tester.pumpAndSettle();
+    expect(find.text('Max 8 data bytes'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+
+    // A cyclic FD frame on a classic channel stops with the reason.
+    state.tx.add(0, CanFrame(id: 1, fd: true, data: Uint8List(8)), const Duration(seconds: 1));
+    await tester.pump();
+    expect(state.tx.jobs.single.error, contains('not in CAN FD mode'));
+    state.tx.jobs.clear();
   });
 
   testWidgets('live view switches between absolute, relative and delta time', (tester) async {

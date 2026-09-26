@@ -25,6 +25,10 @@ class TraceRow {
   DateTime lastSeen;
   DateTime? prevSeen;
 
+  /// The last frame's CAN FD flags.
+  bool fd = false;
+  bool brs = false;
+
   /// Bytes that differed between the last two frames — drives change highlighting.
   int changedMask = 0;
 
@@ -93,9 +97,12 @@ class TraceModel extends ChangeNotifier {
   int errorFrames = 0;
   int _framesSinceTick = 0;
   double framesPerSecond = 0;
-  final _bitsSinceTick = List<int>.filled(channels, 0);
+  final _bitsSinceTick = List<double>.filled(channels, 0);
   final busLoadPercent = List<double>.filled(channels, 0);
   final bitrates = List<int>.filled(channels, 500000);
+
+  /// Data-phase bitrate per channel when it runs CAN FD, null for classic.
+  final dataBitrates = List<int?>.filled(channels, null);
   final List<String> statusLog = [];
 
   TraceModel() {
@@ -116,8 +123,30 @@ class TraceModel extends ChangeNotifier {
 
   /// Nominal frame length on the wire, ignoring bit stuffing (which adds up to
   /// ~20% on pathological payloads). Good enough for a load indicator.
-  static int frameBits(CanFrame f) =>
-      (f.extended ? 67 : 47) + 8 * f.data.length;
+  static int frameBits(CanFrame f) {
+    if (!f.fd) return (f.extended ? 67 : 47) + 8 * f.data.length;
+    return fdArbitrationBits(f) + fdDataBits(f);
+  }
+
+  /// FD bits at the nominal rate: SOF, identifier, control bits up to BRS, and
+  /// CRC delimiter, ACK, EOF and intermission after the data phase.
+  static int fdArbitrationBits(CanFrame f) => f.extended ? 51 : 32;
+
+  /// FD bits in the data phase: ESI, DLC, the padded payload, stuff count and
+  /// the 17- or 21-bit CRC.
+  static int fdDataBits(CanFrame f) {
+    final n = fdPaddedLength(f.data.length);
+    return 5 + 8 * n + 4 + (n > 16 ? 21 : 17);
+  }
+
+  /// The time [f] occupies the bus, in bit times of the nominal [bitrate]:
+  /// with BRS the data phase runs [dataBitrate]/[bitrate] times faster.
+  static double busBits(CanFrame f, int bitrate, int? dataBitrate) {
+    if (!f.fd || !f.brs || dataBitrate == null || dataBitrate <= 0) {
+      return frameBits(f).toDouble();
+    }
+    return fdArbitrationBits(f) + fdDataBits(f) * bitrate / dataBitrate;
+  }
 
   void add(CanFrame frame) {
     final r = recorder;
@@ -134,7 +163,8 @@ class TraceModel extends ChangeNotifier {
     // out of the rate and bus-load figures and out of the grouped view.
     if (!frame.isError) {
       _framesSinceTick++;
-      _bitsSinceTick[frame.channel] += frameBits(frame);
+      final ch = frame.channel;
+      _bitsSinceTick[ch] += busBits(frame, bitrates[ch], dataBitrates[ch]);
     }
     if (paused) {
       // Still counted; only the views are frozen.
@@ -180,7 +210,9 @@ class TraceModel extends ChangeNotifier {
     if (existing == null) {
       _rows[key] = TraceRow(frame.id, frame.extended, frame.channel, frame.data,
           frame.timestamp, frame.direction)
-        ..count = 1;
+        ..count = 1
+        ..fd = frame.fd
+        ..brs = frame.brs;
     } else {
       var mask = 0;
       final n = frame.data.length;
@@ -195,7 +227,9 @@ class TraceModel extends ChangeNotifier {
         ..count += 1
         ..prevSeen = existing.lastSeen
         ..lastSeen = frame.timestamp
-        ..direction = frame.direction;
+        ..direction = frame.direction
+        ..fd = frame.fd
+        ..brs = frame.brs;
     }
   }
 

@@ -22,11 +22,26 @@ const slcanBitrateCodes = {
   250000: 'S5', 500000: 'S6', 800000: 'S7', 1000000: 'S8',
 };
 
+/// CAN FD data bitrates of the CANable 2.0 firmware's SLCAN extension (`Y`).
+const slcanDataBitrateCodes = {
+  1000000: 'Y1', 2000000: 'Y2', 4000000: 'Y4', 5000000: 'Y5', 8000000: 'Y8',
+};
+
+/// Encodes a frame. CAN FD uses the CANable 2.0 extension: `d`/`D` for FD,
+/// `b`/`B` for FD with bit rate switch, and the DLC as one hex digit (0-F).
 String encodeSlcan(CanFrame f) {
-  final len = f.data.length.clamp(0, 8);
   final id = f.extended
       ? f.id.toRadixString(16).toUpperCase().padLeft(8, '0')
       : f.id.toRadixString(16).toUpperCase().padLeft(3, '0');
+  if (f.fd) {
+    final cmd = f.brs ? (f.extended ? 'B' : 'b') : (f.extended ? 'D' : 'd');
+    final dlc = lengthToDlc(f.data.length.clamp(0, 64));
+    final data = Uint8List(fdLengths[dlc])..setAll(0, f.data.take(64));
+    final payload =
+        data.map((b) => b.toRadixString(16).toUpperCase().padLeft(2, '0')).join();
+    return '$cmd$id${dlc.toRadixString(16).toUpperCase()}$payload\r';
+  }
+  final len = f.data.length.clamp(0, 8);
   final cmd = f.rtr
       ? (f.extended ? 'R' : 'r')
       : (f.extended ? 'T' : 't');
@@ -46,22 +61,24 @@ String encodeSlcan(CanFrame f) {
 CanFrame? parseSlcan(String line, {bool timestamps = false}) {
   if (line.isEmpty) return null;
   final kind = line[0];
-  final extended = kind == 'T' || kind == 'R';
+  if (!'tTrRdDbB'.contains(kind)) return null;
+  final extended = 'TRDB'.contains(kind);
   final rtr = kind == 'r' || kind == 'R';
-  if (!'tTrR'.contains(kind)) return null;
+  final fd = 'dDbB'.contains(kind);
 
   final idLen = extended ? 8 : 3;
   if (line.length < 1 + idLen + 1) return null;
 
   final id = int.tryParse(line.substring(1, 1 + idLen), radix: 16);
   final dlc = int.tryParse(line.substring(1 + idLen, 2 + idLen), radix: 16);
-  if (id == null || dlc == null || dlc > 8) return null;
+  if (id == null || dlc == null || (!fd && dlc > 8)) return null;
+  final len = dlcToLength(dlc, fd: fd);
 
   var pos = 2 + idLen;
-  final data = Uint8List(rtr ? 0 : dlc);
+  final data = Uint8List(rtr ? 0 : len);
   if (!rtr) {
-    if (line.length < pos + dlc * 2) return null;
-    for (var i = 0; i < dlc; i++) {
+    if (line.length < pos + len * 2) return null;
+    for (var i = 0; i < len; i++) {
       final b = int.tryParse(line.substring(pos, pos + 2), radix: 16);
       if (b == null) return null;
       data[i] = b;
@@ -80,6 +97,8 @@ CanFrame? parseSlcan(String line, {bool timestamps = false}) {
     data: data,
     extended: extended,
     rtr: rtr,
+    fd: fd,
+    brs: kind == 'b' || kind == 'B',
     hwTimestamp: hw,
   );
 }
@@ -234,6 +253,7 @@ class SlcanBus implements CanBus {
   final _status = StreamController<String>.broadcast();
   String _buffer = '';
   bool _timestamps = false;
+  bool _canFd = false;
 
   @override
   Stream<CanFrame> get frames => _frames.stream;
@@ -243,13 +263,19 @@ class SlcanBus implements CanBus {
   bool get isOpen => _pty != null || (_port?.isOpen ?? false);
 
   @override
-  Future<void> open(String address, int bitrate) async {
+  Future<void> open(String address, int bitrate, {int? dataBitrate}) async {
     final code = slcanBitrateCodes[bitrate];
     if (code == null) {
       throw CanBusException(
           'SLCAN adapters support only the standard bitrates '
           '${slcanBitrateCodes.keys.join(", ")}');
     }
+    final dataCode = dataBitrate == null ? null : slcanDataBitrateCodes[dataBitrate];
+    if (dataBitrate != null && dataCode == null) {
+      throw CanBusException('SLCAN FD adapters support the data bitrates '
+          '${slcanDataBitrateCodes.keys.map((b) => '${b ~/ 1000000}M').join(', ')}');
+    }
+    _canFd = dataBitrate != null;
 
     if (Platform.isWindows || !isPtyPath(address)) {
       _openSerial(address);
@@ -266,6 +292,12 @@ class SlcanBus implements CanBus {
     await Future.delayed(const Duration(milliseconds: 50));
     _write('$code\r');
     await Future.delayed(const Duration(milliseconds: 20));
+    // FD firmware (CANable 2.0) takes the data bitrate; classic firmware
+    // answers BEL and the channel stays classic.
+    if (dataCode != null) {
+      _write('$dataCode\r');
+      await Future.delayed(const Duration(milliseconds: 20));
+    }
     _write('Z1\r'); // request timestamps; harmless if unsupported
     _timestamps = true;
     await Future.delayed(const Duration(milliseconds: 20));
@@ -361,6 +393,7 @@ class SlcanBus implements CanBus {
   @override
   Future<void> send(CanFrame frame) async {
     if (!isOpen) throw CanBusException('bus is not open');
+    checkSendable(frame, fdMode: _canFd);
     _write(encodeSlcan(frame));
   }
 
@@ -398,6 +431,9 @@ class SlcanBackend implements CanBackend {
   String get name => 'SLCAN (CANable, CANtact, USBtin, Lawicel)';
   @override
   bool get available => true; // libserialport ships with the app on all three OSes
+  /// With CANable 2.0 (or compatible) FD firmware.
+  @override
+  bool get supportsFd => true;
   @override
   String get unavailableReason => '';
 

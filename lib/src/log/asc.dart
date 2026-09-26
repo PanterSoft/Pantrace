@@ -81,6 +81,20 @@ class AscWriter extends LogWriter {
     }
     final id = '${f.id.toRadixString(16).toUpperCase()}${f.extended ? 'x' : ''}';
     final dir = f.direction == FrameDirection.tx ? 'Tx' : 'Rx';
+    if (f.fd) {
+      // Vector's CAN FD line: channel, dir, id, (symbolic name), BRS, ESI,
+      // DLC (hex), data length (dec), data, then duration, bit count, flags,
+      // CRC and four bit-timing words we do not know and leave at 0.
+      final n = f.data.length.clamp(0, 64);
+      final flags = 0x1000 | (f.brs ? 0x2000 : 0) | (f.esi ? 0x4000 : 0);
+      _line('$ts CANFD ${'$ch'.padLeft(3)} ${dir.padRight(4)} ${id.padLeft(8)}  '
+          '${''.padLeft(32)} ${f.brs ? 1 : 0} ${f.esi ? 1 : 0} '
+          '${lengthToDlc(n).toRadixString(16)} ${'$n'.padLeft(2)}'
+          '${n == 0 ? '' : ' ${f.dataHex}'} '
+          '${'0'.padLeft(8)} ${'0'.padLeft(4)} ${flags.toRadixString(16).toUpperCase().padLeft(8)} '
+          '${'0'.padLeft(8)} ${'0'.padLeft(8)} ${'0'.padLeft(8)} ${'0'.padLeft(8)} ${'0'.padLeft(8)}');
+      return;
+    }
     final len = f.data.length.toRadixString(16).toUpperCase();
     final body = f.rtr ? 'r $len' : 'd $len ${f.dataHex}';
     _line('$ts $ch  ${id.padRight(15)} ${dir.padRight(4)} $body'.trimRight());
@@ -97,6 +111,33 @@ final _frameRe = RegExp(
     r'^\s*(\d+(?:\.\d+)?)\s+(\d+)\s+([0-9A-Fa-f]+)(x?)\s+(Rx|Tx|TxRq)\s+([dDrR])\s*([0-9A-Fa-f]+)?(.*)$');
 final _errorRe = RegExp(r'^\s*(\d+(?:\.\d+)?)\s+(\d+)\s+ErrorFrame', caseSensitive: false);
 final _eventRe = RegExp(r'^\s*\d+(?:\.\d+)?\s+(\S+)');
+final _fdRe = RegExp(r'^\s*(\d+(?:\.\d+)?)\s+CANFD\s+(\d+)\s+(Rx|Tx)\s+(\S+)\s+(.*)$');
+
+/// One CANFD line's fields after the id, or null when they do not parse.
+({bool brs, bool esi, bool fd, bool rtr, Uint8List data})? _fdFields(String rest, int radix) {
+  var t = rest.trim().split(RegExp(r'\s+'));
+  // The symbolic name is optional; BRS is always 0 or 1.
+  if (t.isNotEmpty && t[0] != '0' && t[0] != '1') t = t.sublist(1);
+  if (t.length < 4) return null;
+  final dlc = int.tryParse(t[2], radix: 16);
+  final len = int.tryParse(t[3]);
+  if (dlc == null || len == null || len > 64 || t.length < 4 + len) return null;
+  final data = Uint8List(len);
+  for (var i = 0; i < len; i++) {
+    final v = int.tryParse(t[4 + i], radix: radix);
+    if (v == null || v > 0xFF) return null;
+    data[i] = v;
+  }
+  // Flags follow duration and bit count; without them it is an FD frame.
+  final flags = t.length > 6 + len ? int.tryParse(t[6 + len], radix: 16) : null;
+  return (
+    brs: t[0] == '1',
+    esi: t[1] == '1',
+    fd: flags == null || flags & 0x1000 != 0,
+    rtr: flags != null && flags & 0x10 != 0,
+    data: data,
+  );
+}
 
 DecodedLog readAsc(Uint8List bytes) {
   final text = latin1.decode(bytes, allowInvalid: true);
@@ -164,6 +205,30 @@ DecodedLog readAsc(Uint8List bytes) {
       ));
       continue;
     }
+    final fdm = _fdRe.firstMatch(line);
+    if (fdm != null) {
+      final idText = fdm.group(4)!;
+      final ext = idText.toLowerCase().endsWith('x');
+      final id = int.tryParse(ext ? idText.substring(0, idText.length - 1) : idText, radix: radix);
+      final f = _fdFields(fdm.group(5)!, radix);
+      if (id == null || f == null) {
+        skipped++;
+        continue;
+      }
+      frames.add(CanFrame(
+        id: id,
+        extended: ext || id > 0x7FF,
+        fd: f.fd,
+        brs: f.fd && f.brs,
+        esi: f.fd && f.esi,
+        rtr: f.rtr,
+        data: f.rtr ? Uint8List(0) : f.data,
+        timestamp: at(double.parse(fdm.group(1)!)),
+        direction: fdm.group(3) == 'Tx' ? FrameDirection.tx : FrameDirection.rx,
+        channel: int.parse(fdm.group(2)!) - 1,
+      ));
+      continue;
+    }
     final e = _errorRe.firstMatch(line);
     if (e != null) {
       frames.add(CanFrame.error('error frame',
@@ -171,8 +236,8 @@ DecodedLog readAsc(Uint8List bytes) {
           channel: int.parse(e.group(2)!) - 1));
       continue;
     }
-    // CAN FD, LIN, statistics... A timestamped line we did not take is a
-    // skipped record; `Start of measurement` and friends are not.
+    // A CANFD line we could not read is a skipped record; LIN, statistics,
+    // `Start of measurement` and friends are not frames at all.
     final ev = _eventRe.firstMatch(line);
     if (ev != null && ev.group(1)!.toUpperCase().startsWith('CANFD')) skipped++;
   }

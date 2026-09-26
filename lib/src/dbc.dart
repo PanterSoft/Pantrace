@@ -135,6 +135,11 @@ class DbcMessage {
   final List<DbcSignal> signals;
   String comment;
 
+  /// Sent as CAN FD: the VFrameFormat attribute says so, or it is longer than
+  /// a classic frame can carry.
+  bool get fd => fdFormat || length > 8;
+  bool fdFormat = false;
+
   DbcMessage({
     required this.id,
     required this.extended,
@@ -196,6 +201,7 @@ final _sgRe = RegExp(
   r'\[([^|]*)\|([^\]]*)\]\s*'
   r'"([^"]*)"\s*(.*)$',
 );
+final _frameFormatRe = RegExp(r'^BA_\s+"VFrameFormat"\s+BO_\s+(\d+)\s+(\d+)\s*;');
 final _valRe = RegExp(r'^VAL_\s+(\d+)\s+([A-Za-z0-9_]+)\s+(.*);');
 final _valPairRe = RegExp(r'(-?\d+)\s+"([^"]*)"');
 final _cmMsgRe = RegExp(r'^CM_\s+BO_\s+(\d+)\s+"(.*)"\s*;', dotAll: true);
@@ -308,7 +314,15 @@ DbcDatabase parseDbc(String source) {
       continue;
     }
 
-    // BO_TX_BU_, BA_, SIG_VALTYPE_, NS_, etc. — not needed for tracing.
+    // VFrameFormat 14 / 15 is StandardCAN_FD / ExtendedCAN_FD.
+    final fdm = _frameFormatRe.firstMatch(line);
+    if (fdm != null) {
+      final v = int.parse(fdm.group(2)!);
+      byRawId[int.parse(fdm.group(1)!)]?.fdFormat = v == 14 || v == 15;
+      continue;
+    }
+
+    // BO_TX_BU_, other BA_, SIG_VALTYPE_, NS_, etc. — not needed for tracing.
     if (line.startsWith('BO_') || line.startsWith('SG_')) continue;
   }
 

@@ -18,7 +18,7 @@ class _FakeBus implements CanBus {
   @override
   bool get isOpen => true;
   @override
-  Future<void> open(String address, int bitrate) async {}
+  Future<void> open(String address, int bitrate, {int? dataBitrate}) async {}
   @override
   Future<void> close() async {}
   @override

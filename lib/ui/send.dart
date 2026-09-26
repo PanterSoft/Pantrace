@@ -26,6 +26,9 @@ class _SendDialogState extends State<_SendDialog> {
   final cycleCtrl = TextEditingController();
   bool extended = false;
   bool rtr = false;
+  // FD defaults on when the channel runs FD; BRS is what FD buses use.
+  late bool fd = widget.state.channels[channel].dataBitrate != null;
+  bool brs = true;
   String? error;
   DbcMessage? message;
   final signalCtrls = <String, TextEditingController>{};
@@ -47,8 +50,8 @@ class _SendDialogState extends State<_SendDialog> {
       setState(() => error = 'Data needs whole bytes');
       return null;
     }
-    if (hex.length > 16) {
-      setState(() => error = 'Max 8 data bytes');
+    if (hex.length > (fd ? 128 : 16)) {
+      setState(() => error = fd ? 'Max 64 data bytes' : 'Max 8 data bytes');
       return null;
     }
     final data = Uint8List(hex.length ~/ 2);
@@ -66,7 +69,8 @@ class _SendDialogState extends State<_SendDialog> {
       idCtrl.text = m.id.toRadixString(16).toUpperCase();
       extended = m.extended;
       rtr = false;
-      final data = Uint8List(m.length.clamp(0, 8));
+      fd = m.fd;
+      final data = Uint8List(m.length.clamp(0, fd ? 64 : 8));
       dataCtrl.text = _hexBytes(data);
       _showSignals(data);
     });
@@ -92,8 +96,8 @@ class _SendDialogState extends State<_SendDialog> {
     final phys = double.tryParse(text.trim());
     if (named == null && phys == null) return;
     final current = _data() ?? Uint8List(0);
-    final data = Uint8List(m.length.clamp(0, 8))
-      ..setRange(0, math.min(current.length, m.length.clamp(0, 8)), current);
+    final len = m.length.clamp(0, fd ? 64 : 8);
+    final data = Uint8List(len)..setRange(0, math.min(current.length, len), current);
     s.rawInto(data, named ?? s.encodeRaw(phys!));
     setState(() {
       error = null;
@@ -107,15 +111,25 @@ class _SendDialogState extends State<_SendDialog> {
     if (id > (extended ? 0x1FFFFFFF : 0x7FF)) {
       return setState(() => error = 'ID does not fit in an ${extended ? 29 : 11}-bit identifier');
     }
-    final data = _data();
+    var data = _data();
     if (data == null) return;
+    if (fd && rtr) return setState(() => error = 'CAN FD has no remote frames');
+    // FD lengths go 8, 12, 16, 20, 24, 32, 48, 64: pad up to the next one.
+    if (fd && fdPaddedLength(data.length) != data.length) {
+      data = Uint8List(fdPaddedLength(data.length))..setAll(0, data);
+    }
     final cycleText = cycleCtrl.text.trim();
     final cycle = cycleText.isEmpty ? 0 : int.tryParse(cycleText);
     if (cycle == null || cycle < 0) {
       return setState(() => error = 'Cycle time must be whole milliseconds');
     }
     final frame = CanFrame(
-        id: id, data: data, extended: extended, rtr: rtr, direction: FrameDirection.tx);
+        id: id, data: data, extended: extended, rtr: rtr,
+        fd: fd, brs: fd && brs, direction: FrameDirection.tx);
+    if (fd && widget.state.channels[channel].dataBitrate == null) {
+      return setState(() => error =
+          'CAN${channel + 1} runs classic CAN — reconnect it with an FD mode to send CAN FD');
+    }
     try {
       if (cycle > 0) {
         widget.state.tx.add(channel, frame, Duration(milliseconds: cycle));
@@ -185,10 +199,12 @@ class _SendDialogState extends State<_SendDialog> {
                   final d = _data();
                   if (d != null) _showSignals(d);
                 },
-                decoration: const InputDecoration(
+                maxLines: null,
+                decoration: InputDecoration(
                     labelText: 'Data (hex bytes)',
                     hintText: 'DE AD BE EF',
-                    border: OutlineInputBorder()),
+                    helperText: fd ? 'up to 64 bytes, padded to the next FD length' : null,
+                    border: const OutlineInputBorder()),
               ),
               if (message != null)
                 for (final s in message!.signals)
@@ -236,7 +252,30 @@ class _SendDialogState extends State<_SendDialog> {
                     contentPadding: EdgeInsets.zero,
                     title: const Text('RTR', style: TextStyle(fontSize: 13)),
                     value: rtr,
-                    onChanged: (v) => setState(() => rtr = v!),
+                    onChanged: fd ? null : (v) => setState(() => rtr = v!),
+                  ),
+                ),
+              ]),
+              Row(children: [
+                Expanded(
+                  child: CheckboxListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('CAN FD', style: TextStyle(fontSize: 13)),
+                    value: fd,
+                    onChanged: (v) => setState(() {
+                      fd = v!;
+                      if (fd) rtr = false;
+                    }),
+                  ),
+                ),
+                Expanded(
+                  child: CheckboxListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('BRS', style: TextStyle(fontSize: 13)),
+                    value: fd && brs,
+                    onChanged: fd ? (v) => setState(() => brs = v!) : null,
                   ),
                 ),
               ]),
@@ -287,8 +326,10 @@ class _TxListDialog extends StatelessWidget {
                           leading: Text('CAN${j.channel + 1}', style: _mono),
                           title: Text(
                               '${j.frame.extended ? 'x' : ''}${j.frame.idHex}  '
-                              '[${j.frame.data.length}] ${j.frame.dataHex}'
-                              '${j.frame.rtr ? '  RTR' : ''}',
+                              '[${j.frame.data.length}]${j.frame.fd ? ' ${j.frame.fdLabel}' : ''} '
+                              '${j.frame.dataHex}${j.frame.rtr ? '  RTR' : ''}',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                               style: _mono),
                           subtitle: Text(
                               j.error ??

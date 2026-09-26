@@ -1,5 +1,5 @@
-// ASAM MDF 4.1 (.mf4) with the ASAM bus-logging layout: CAN_DataFrame,
-// CAN_RemoteFrame and CAN_ErrorFrame channel groups, each record carrying a
+// ASAM MDF 4.1 (.mf4) with the ASAM bus-logging layout: CAN_DataFrame
+// (classic and FD), CAN_RemoteFrame and CAN_ErrorFrame channel groups, each record carrying a
 // float64 time stamp plus the frame's composed fields. asammdf, CANape and
 // CANoe read these as a CAN bus log and can decode them against a DBC.
 //
@@ -88,6 +88,20 @@ const _remoteFields = [
   _Field('DataLength', 14, 7),
   _Field('Dir', 15, 1),
 ];
+/// CAN FD data frames get their own group, so a classic-only recording is
+/// not padded to 64 data bytes per frame.
+const _fdDataFields = [
+  _Field('BusChannel', 8, 8),
+  _Field('ID', 9, 29),
+  _Field('IDE', 12, 1, bitOffset: 7),
+  _Field('DLC', 13, 4),
+  _Field('DataLength', 14, 7),
+  _Field('EDL', 15, 1),
+  _Field('BRS', 15, 1, bitOffset: 1),
+  _Field('ESI', 15, 1, bitOffset: 2),
+  _Field('Dir', 15, 1, bitOffset: 3),
+  _Field('DataBytes', 16, 512, dataType: _dtBytes),
+];
 const _errorFields = [
   _Field('BusChannel', 8, 8),
   _Field('ErrorType', 9, 8),
@@ -97,7 +111,7 @@ const _errorFields = [
 class Mf4Writer extends LogWriter {
   late final _Block _dt;
   final _cgs = <_Block>[];
-  final _cycles = [0, 0, 0];
+  final _cycles = [0, 0, 0, 0];
   var _dataStart = 0;
 
   Mf4Writer(super.sink, super.start) {
@@ -164,8 +178,9 @@ class Mf4Writer extends LogWriter {
 
     final error = group('CAN_ErrorFrame', 3, 16, _errorFields, null);
     final remote = group('CAN_RemoteFrame', 2, 16, _remoteFields, error);
-    final data = group('CAN_DataFrame', 1, 24, _dataFields, remote);
-    _cgs.addAll([data, remote, error]);
+    final fdData = group('CAN_DataFrame', 4, 80, _fdDataFields, remote);
+    final data = group('CAN_DataFrame', 1, 24, _dataFields, fdData);
+    _cgs.addAll([data, remote, error, fdData]);
 
     _dt = _Block('DT', const [], Uint8List(0));
     final dg = _Block('DG', [null, data, _dt, null],
@@ -236,7 +251,19 @@ class Mf4Writer extends LogWriter {
     final w = LeWriter();
     final dir = f.direction == FrameDirection.tx ? 1 : 0;
     final ch = (f.channel + 1) & 0xFF;
-    if (f.isError) {
+    if (f.fd) {
+      final n = f.data.length.clamp(0, 64);
+      w
+        ..u8(4)
+        ..f64(t)
+        ..u8(ch)
+        ..u32((f.id & 0x1FFFFFFF) | (f.extended ? 0x80000000 : 0))
+        ..u8(lengthToDlc(n))
+        ..u8(n)
+        ..u8(1 | (f.brs ? 2 : 0) | (f.esi ? 4 : 0) | dir << 3)
+        ..bytes(Uint8List(64)..setRange(0, n, f.data));
+      _cycles[3]++;
+    } else if (f.isError) {
       w
         ..u8(3)
         ..f64(t)
@@ -589,12 +616,9 @@ DecodedLog readMf4(Uint8List bytes) {
                 timestamp: t, direction: dir, channel: channel)));
         continue;
       }
-      if ((val('EDL') ?? 0) == 1) {
-        skipped++; // CAN FD
-        continue;
-      }
-      final length = val('DataLength') ?? (dlc > 8 ? 8 : dlc);
-      if (length > 8) {
+      final fd = (val('EDL') ?? 0) == 1;
+      final length = val('DataLength') ?? dlcToLength(dlc, fd: fd);
+      if (length > (fd ? 64 : 8)) {
         skipped++;
         continue;
       }
@@ -613,6 +637,7 @@ DecodedLog readMf4(Uint8List bytes) {
       }
       frames.add((seconds, frames.length,
           CanFrame(id: id, extended: extended, data: Uint8List.fromList(payload.sublist(0, length)),
+              fd: fd, brs: fd && val('BRS') == 1, esi: fd && val('ESI') == 1,
               timestamp: t, direction: dir, channel: channel)));
     }
     dgAt = dg.links[0];

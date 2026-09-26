@@ -23,7 +23,7 @@ class _FakeBus implements CanBus {
   @override
   bool get isOpen => true;
   @override
-  Future<void> open(String address, int bitrate) async {}
+  Future<void> open(String address, int bitrate, {int? dataBitrate}) async {}
   @override
   Future<void> close() async {}
   @override
@@ -90,6 +90,31 @@ void main() {
     await bus.close(); // idempotent
     await expectLater(bus.send(CanFrame(id: 1, data: Uint8List(0))),
         throwsA(isA<CanBusException>()));
+  });
+
+  test('CAN FD through a CANable 2.0 style adapter, both ways', () async {
+    final bus = SlcanBus();
+    final got = <CanFrame>[];
+    bus.frames.listen(got.add);
+    await bus.open(pty, 500000, dataBitrate: 2000000);
+
+    adapter.inject(CanFrame(
+        id: 0x300, fd: true, brs: true, data: Uint8List.fromList(List.generate(64, (i) => i))));
+    await until(() => got.isNotEmpty);
+    expect((got.single.fd, got.single.brs, got.single.data.length, got.single.data.last),
+        (true, true, 64, 63));
+
+    await bus.send(CanFrame(
+        id: 0x18DAF110, extended: true, fd: true, data: Uint8List.fromList(List.filled(12, 7))));
+    await until(() => adapter.sent.isNotEmpty);
+    final f = adapter.sent.single;
+    expect((f.id, f.extended, f.fd, f.brs, f.data.length), (0x18DAF110, true, true, false, 12));
+
+    // Opened for FD, it still refuses what CAN FD cannot carry.
+    await expectLater(
+        bus.send(CanFrame(id: 1, rtr: true, fd: true, data: Uint8List(0))),
+        throwsA(isA<CanBusException>()));
+    await bus.close();
   });
 
   test('refuses what the protocol cannot express or the OS cannot open', () async {

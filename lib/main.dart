@@ -92,6 +92,9 @@ class _Channel {
   CanShare? share;
   CanDevice? device;
   int bitrate = 500000;
+
+  /// CAN FD data-phase bitrate; null runs the channel as classic CAN.
+  int? dataBitrate;
   bool connecting = false;
   bool get connected => bus != null;
 }
@@ -187,11 +190,17 @@ class _TracerPageState extends State<TracerPage> {
     final c = channels[ch];
     final bus = c.bus;
     if (bus == null) throw CanBusException('CAN${ch + 1} is not connected');
+    checkSendable(template, fdMode: c.dataBitrate != null);
     final frame = CanFrame(
         id: template.id,
-        data: template.data,
+        // FD payloads only come in some lengths; pad like the controller would.
+        data: template.fd && fdPaddedLength(template.data.length) != template.data.length
+            ? (Uint8List(fdPaddedLength(template.data.length))..setAll(0, template.data))
+            : template.data,
         extended: template.extended,
         rtr: template.rtr,
+        fd: template.fd,
+        brs: template.fd && template.brs,
         direction: FrameDirection.tx);
     await bus.send(frame);
     // Drivers that do not echo transmissions still need the frame traced.
@@ -239,9 +248,12 @@ class _TracerPageState extends State<TracerPage> {
         // The backend closes itself when the device goes away.
         if (!b.isOpen && c.bus == b && mounted) setState(() => c.bus = null);
       });
-      await b.open(d.address, c.bitrate);
+      final fd = backendById(d.backend).supportsFd ? c.dataBitrate : null;
+      await b.open(d.address, c.bitrate, dataBitrate: fd);
       model.bitrates[ch] = c.bitrate;
-      model.addStatus('CAN${ch + 1}: connected to ${d.label} at ${c.bitrate} bit/s');
+      model.dataBitrates[ch] = fd;
+      model.addStatus('CAN${ch + 1}: connected to ${d.label} at ${c.bitrate} bit/s'
+          '${fd == null ? '' : ', CAN FD data phase $fd bit/s'}');
       setState(() => c.bus = b);
     } catch (e) {
       model.addStatus('CAN${ch + 1}: $e');
@@ -388,7 +400,7 @@ class _TracerPageState extends State<TracerPage> {
         expanded.clear();
         if (expand) {
           expanded.addAll(model.groupedRows
-              .where((r) => model.messageFor(r.channel, r.id, r.extended) != null)
+              .where((r) => _expandable(r, model.messageFor(r.channel, r.id, r.extended)))
               .map((r) => r.key));
         }
       });
@@ -413,7 +425,11 @@ class _TracerPageState extends State<TracerPage> {
     if (mounted) setState(() {});
   }
 
-  void setDevice(int ch, CanDevice? d) => setState(() => channels[ch].device = d);
+  void setDevice(int ch, CanDevice? d) => setState(() {
+        channels[ch].device = d;
+        if (d == null || !backendById(d.backend).supportsFd) channels[ch].dataBitrate = null;
+      });
+  void setDataBitrate(int ch, int? b) => setState(() => channels[ch].dataBitrate = b);
   void setBitrate(int ch, int b) => setState(() => channels[ch].bitrate = b);
   void setProbeSerial(bool v) {
     (backendById('slcan') as SlcanBackend).probe = v;
@@ -574,6 +590,8 @@ class _Toolbar extends StatelessWidget {
   List<Widget> _channel(int ch, double Function(double) cap) {
     final c = state.channels[ch];
     final connected = c.connected;
+    final dev = c.device;
+    final fdCapable = dev != null && backendById(dev.backend).supportsFd;
     return [
       Text('CAN${ch + 1}',
           style: TextStyle(
@@ -609,6 +627,30 @@ class _Toolbar extends StatelessWidget {
                   child: Text('${b ~/ 1000} kbit/s', overflow: TextOverflow.ellipsis)))
               .toList(),
           onChanged: connected ? null : (b) => state.setBitrate(ch, b!),
+        ),
+      ),
+      SizedBox(
+        width: cap(110),
+        // Rebuilt when the device's FD support changes, so the field never
+        // holds a value its item list no longer has.
+        child: KeyedSubtree(
+          key: ValueKey(fdCapable),
+          child: DropdownButtonFormField<int?>(
+          key: ValueKey('mode$ch'),
+          initialValue: c.dataBitrate,
+          isExpanded: true,
+          decoration: const InputDecoration(
+              labelText: 'Mode', border: OutlineInputBorder(), isDense: true),
+          items: [
+            const DropdownMenuItem(value: null, child: Text('CAN')),
+            if (fdCapable)
+              for (final b in kFdDataBitrates)
+                DropdownMenuItem(
+                    value: b,
+                    child: Text('FD ${b ~/ 1000000}M', overflow: TextOverflow.ellipsis)),
+          ],
+          onChanged: connected || !fdCapable ? null : (b) => state.setDataBitrate(ch, b),
+        ),
         ),
       ),
       // Fixed width: 'Disconnect' is wider than 'Connect', and letting the
@@ -815,33 +857,48 @@ Widget _sortHeader(TraceModel model, String label, int flex, TraceSort column) {
   );
 }
 
-/// Hex payload with per-byte highlighting of what just changed.
+/// Hex payload with per-byte highlighting of what just changed. One line: a
+/// 64-byte FD payload is cut with an ellipsis (expand the row for all of it).
 class _HexData extends StatelessWidget {
   final Uint8List data;
   final int changedMask;
-  const _HexData(this.data, {this.changedMask = 0});
+  final int offset;
+  const _HexData(this.data, {this.changedMask = 0, this.offset = 0});
 
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
-    return Row(
-      children: [
+    return Text.rich(
+      TextSpan(children: [
         for (var i = 0; i < data.length; i++)
-          Padding(
-            padding: const EdgeInsets.only(right: 6),
-            child: Text(
-              data[i].toRadixString(16).toUpperCase().padLeft(2, '0'),
-              style: _mono.copyWith(
-                color: (changedMask >> i) & 1 == 1 ? accent : null,
-                fontWeight:
-                    (changedMask >> i) & 1 == 1 ? FontWeight.bold : null,
-              ),
-            ),
+          TextSpan(
+            text: '${data[i].toRadixString(16).toUpperCase().padLeft(2, '0')} ',
+            style: (changedMask >> (i + offset)) & 1 == 1
+                ? TextStyle(color: accent, fontWeight: FontWeight.bold)
+                : null,
           ),
-      ],
+      ]),
+      style: _mono,
+      maxLines: 1,
+      softWrap: false,
+      overflow: TextOverflow.ellipsis,
     );
   }
 }
+
+/// Payload length, tagged FD (and BRS) for CAN FD frames.
+Widget _lenText(int length, {bool fd = false, bool brs = false}) => Text.rich(
+      TextSpan(text: '$length', children: [
+        if (fd)
+          TextSpan(
+              text: brs ? ' FD·B' : ' FD',
+              style: const TextStyle(fontSize: 9, color: Colors.lightBlueAccent)),
+      ]),
+      style: _mono,
+      maxLines: 1,
+      softWrap: false,
+      overflow: TextOverflow.clip,
+    );
 
 /// A line in the grouped trace: either a message or, when that message is
 /// expanded and decodable, one of its signals — CANoe's trace window layout.
@@ -859,6 +916,17 @@ class _SigLine extends _Line {
   _SigLine(this.row, this.sig);
 }
 
+/// 16 bytes of a long (CAN FD) payload, shown under its expanded message.
+class _DataLine extends _Line {
+  final TraceRow row;
+  final int offset;
+  _DataLine(this.row, this.offset);
+}
+
+/// Rows that open: decodable ones, and ones whose payload is too long to
+/// read in one table cell.
+bool _expandable(TraceRow r, DbcMessage? msg) => msg != null || r.data.length > 8;
+
 class _GroupedTable extends StatelessWidget {
   final _TracerPageState state;
   const _GroupedTable({required this.state});
@@ -870,9 +938,16 @@ class _GroupedTable extends StatelessWidget {
     for (final r in model.groupedRows) {
       final msg = model.messageFor(r.channel, r.id, r.extended);
       lines.add(_MsgLine(r, msg));
-      if (msg != null && state.expanded.contains(r.key)) {
-        for (final sig in msg.signalsFor(r.data)) {
-          lines.add(_SigLine(r, sig));
+      if (state.expanded.contains(r.key)) {
+        if (msg != null) {
+          for (final sig in msg.signalsFor(r.data)) {
+            lines.add(_SigLine(r, sig));
+          }
+        }
+        if (r.data.length > 8) {
+          for (var o = 0; o < r.data.length; o += 16) {
+            lines.add(_DataLine(r, o));
+          }
         }
       }
     }
@@ -889,7 +964,9 @@ class _GroupedTable extends StatelessWidget {
                 tooltip: anyExpanded ? 'Collapse all' : 'Expand all',
                 visualDensity: VisualDensity.compact,
                 iconSize: 18,
-                onPressed: model.dbcs.every((d) => d == null)
+                onPressed: !anyExpanded &&
+                        !model.groupedRows.any((r) =>
+                            _expandable(r, model.messageFor(r.channel, r.id, r.extended)))
                     ? null
                     : () => state.expandAll(!anyExpanded),
                 icon: Icon(anyExpanded ? Icons.unfold_less : Icons.unfold_more),
@@ -913,6 +990,7 @@ class _GroupedTable extends StatelessWidget {
                   itemBuilder: (context, i) => switch (lines[i]) {
                     _MsgLine l => _messageRow(context, l),
                     _SigLine l => _signalRow(context, l),
+                    _DataLine l => _dataRow(l),
                   },
                 ),
         ),
@@ -926,8 +1004,9 @@ class _GroupedTable extends StatelessWidget {
     final theme = Theme.of(context);
     final open = state.expanded.contains(r.key);
     final period = r.periodMs;
+    final canOpen = _expandable(r, msg);
     return InkWell(
-      onTap: msg == null ? null : () => state.toggleExpanded(r.key),
+      onTap: canOpen ? () => state.toggleExpanded(r.key) : null,
       child: Container(
         color: open ? theme.colorScheme.primary.withValues(alpha: 0.08) : null,
         padding: const EdgeInsets.only(left: 4, right: 12),
@@ -935,7 +1014,7 @@ class _GroupedTable extends StatelessWidget {
           children: [
             SizedBox(
               width: 40,
-              child: msg == null
+              child: !canOpen
                   ? null
                   : Icon(open ? Icons.arrow_drop_down : Icons.arrow_right,
                       size: 20, color: theme.colorScheme.primary),
@@ -952,7 +1031,7 @@ class _GroupedTable extends StatelessWidget {
                     style: TextStyle(
                         fontSize: 13,
                         color: msg == null ? Colors.grey : theme.colorScheme.primary))),
-            Expanded(flex: 1, child: Text('${r.data.length}', style: _mono)),
+            Expanded(flex: 1, child: _lenText(r.data.length, fd: r.fd, brs: r.brs)),
             Expanded(flex: 6, child: _HexData(r.data, changedMask: r.changedMask)),
             Expanded(flex: 2, child: Text('${r.count}', style: _mono)),
             Expanded(
@@ -961,6 +1040,30 @@ class _GroupedTable extends StatelessWidget {
                     style: _mono)),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _dataRow(_DataLine l) {
+    final end = math.min(l.offset + 16, l.row.data.length);
+    return Padding(
+      padding: const EdgeInsets.only(left: 4, right: 12),
+      child: Row(
+        children: [
+          const SizedBox(width: 40),
+          const Expanded(flex: 3, child: SizedBox()),
+          Expanded(
+              flex: 5,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 16),
+                child: Text('└ bytes ${l.offset}–${end - 1}',
+                    style: const TextStyle(fontSize: 13, color: Colors.grey)),
+              )),
+          Expanded(
+              flex: 10,
+              child: _HexData(Uint8List.sublistView(l.row.data, l.offset, end),
+                  changedMask: l.row.changedMask, offset: l.offset)),
+        ],
       ),
     );
   }
@@ -1123,7 +1226,7 @@ class _LiveTable extends StatelessWidget {
                                             : Theme.of(context).colorScheme.primary))),
                             Expanded(
                                 flex: 1,
-                                child: Text('${f.data.length}', style: _mono)),
+                                child: _lenText(f.data.length, fd: f.fd, brs: f.brs)),
                             Expanded(flex: 6, child: _HexData(f.data)),
                           ],
                         ),
