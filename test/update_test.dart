@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:ffi' show Abi;
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -111,8 +112,11 @@ void main() {
     };
     try {
       os = 'windows';
+      arch = 'x64';
       expect(canSelfInstall, isTrue);
       expect(assetUrl('v1.2.3'), endsWith('/v1.2.3/Pantrace-windows-x64-setup.exe'));
+      arch = 'arm64';
+      expect(assetUrl('v1.2.3'), endsWith('/v1.2.3/Pantrace-windows-arm64-setup.exe'));
       openReleasePage();
       os = 'macos';
       expect(assetUrl('v1.2.3'), endsWith('/v1.2.3/Pantrace-macos.dmg'));
@@ -127,8 +131,17 @@ void main() {
       ]);
     } finally {
       os = Platform.operatingSystem;
+      arch = archOf(Abi.current());
       launch = realLaunch;
     }
+  });
+
+  test('architectures map onto the asset names', () {
+    expect(archOf(Abi.windowsArm64), 'arm64');
+    expect(archOf(Abi.linuxArm64), 'arm64');
+    expect(archOf(Abi.macosArm64), 'arm64');
+    expect(archOf(Abi.windowsX64), 'x64');
+    expect(archOf(Abi.linuxX64), 'x64');
   });
 
   test('the default launcher runs a real process', () async {
@@ -157,17 +170,24 @@ void main() {
 
   test('the install asset is one CI actually publishes', () {
     // Renaming a release asset would otherwise 404 only at install time.
-    final built = File('.github/workflows/ci.yml').readAsStringSync() +
-        File('windows/installer.iss').readAsStringSync();
-    for (final name in ['Pantrace-windows-x64-setup', 'Pantrace-macos.dmg']) {
-      expect(built, contains(name));
-    }
-    os = 'macos';
+    final ci = File('.github/workflows/ci.yml').readAsStringSync();
+    final iss = File('windows/installer.iss').readAsStringSync();
+    final installer = RegExp(r'OutputBaseFilename=(\S+)').firstMatch(iss)!.group(1)!;
     try {
+      os = 'windows';
+      for (final a in ['x64', 'arm64']) {
+        arch = a;
+        // The installer is built once per Windows architecture in the matrix.
+        expect(ci, contains(RegExp('target: windows, *arch: $a')));
+        expect('${installer.replaceAll('{#Arch}', a)}.exe', assetUrl('v1').split('/').last);
+      }
+      expect(ci, contains('Pantrace-macos.dmg'));
+      os = 'macos';
       expect(assetUrl('v1.2.3'),
           matches(r'^https://github\.com/.+/releases/download/v1\.2\.3/Pantrace-'));
     } finally {
       os = Platform.operatingSystem;
+      arch = archOf(Abi.current());
     }
   });
 }

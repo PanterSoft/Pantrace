@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:ffi' show Abi;
 import 'dart:io';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
@@ -65,10 +66,21 @@ void openReleasePage() => launch(
 
 // --- installing ---------------------------------------------------------
 
+/// CPU architecture as the release assets name it; a test sets it.
+@visibleForTesting
+var arch = archOf(Abi.current());
+
+@visibleForTesting
+String archOf(Abi abi) => switch (abi) {
+      Abi.windowsArm64 || Abi.linuxArm64 || Abi.macosArm64 => 'arm64',
+      _ => 'x64',
+    };
+
 /// Release asset this platform can install unattended, or null when it has no
-/// such path (Linux: the .deb needs root, so the browser takes over).
+/// such path (Linux: the .deb needs root, so the browser takes over). The
+/// macOS build is universal, so it has no architecture in its name.
 String? get _assetName => os == 'windows'
-    ? 'Pantrace-windows-x64-setup.exe'
+    ? 'Pantrace-windows-$arch-setup.exe'
     : os == 'macos'
         ? 'Pantrace-macos.dmg'
         : null;

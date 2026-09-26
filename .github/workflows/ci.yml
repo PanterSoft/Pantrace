@@ -1,16 +1,42 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes the run in progress; main is
+# never cancelled, a release may be half way out.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run: { shell: bash }
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-        with: { channel: stable }
-      - run: make analyze
-      - run: make test
+        with: { channel: stable, cache: true }
+      - run: flutter pub get && flutter analyze
+      # Linux and macOS run everything, SLCAN over a real pseudo-terminal included.
+      - if: runner.os != 'Windows'
+        run: make test
+      # Windows has no pty and no test build of libserialport: it runs the
+      # platform-neutral suites — log formats, trace model, transmit, DBC, UI.
+      - if: runner.os == 'Windows'
+        run: >
+          flutter test test/log_test.dart test/transmit_test.dart test/trace_test.dart
+          test/dbc_test.dart test/app_test.dart test/small_window_test.dart
 
   # Every push to main releases. The version is the pubspec one while it has no
   # release yet (so a manual 1.1.0 is honoured), then the next patch. It is
@@ -46,24 +72,38 @@ jobs:
               commit -m "Version $V [skip ci]" pubspec.yaml
           git push origin HEAD:main
 
+  # One native build per OS and CPU. macOS builds a universal (arm64 + x86_64)
+  # app, so it needs a single leg.
   build:
     needs: version
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: linux }
-          - { os: windows-latest, target: windows }
-          - { os: macos-latest,   target: macos }
+          - { os: ubuntu-latest,    target: linux,   arch: x64 }
+          - { os: ubuntu-24.04-arm, target: linux,   arch: arm64 }
+          - { os: windows-latest,   target: windows, arch: x64 }
+          - { os: windows-11-arm,   target: windows, arch: arm64, experimental: true }
+          - { os: macos-latest,     target: macos,   arch: universal }
     runs-on: ${{ matrix.os }}
+    # Windows on Arm is the newest Flutter host; it must not hold a release.
+    continue-on-error: ${{ matrix.experimental == true }}
     defaults:
       run: { shell: bash }
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with: { channel: stable }
+      - if: matrix.arch != 'arm64'
+        uses: subosito/flutter-action@v2
+        with: { channel: stable, cache: true }
+      # flutter-action installs x64 SDK archives only; on Arm hosts take the
+      # SDK from git, which fetches the matching native engine on first run.
+      - if: matrix.arch == 'arm64'
+        run: |
+          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+      - run: flutter --version
       # Build this commit, but stamped with the version being released: the app
       # bundle's own version comes from pubspec, not from the dart-define.
       - run: |
@@ -72,27 +112,37 @@ jobs:
       - if: matrix.target == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libgtk-3-dev
+          sudo apt-get install -y ninja-build libgtk-3-dev rpm
       - if: matrix.target == 'macos'
         run: brew install automake libtool  # libserialport pod builds from source
       - run: flutter build ${{ matrix.target }} --release --dart-define=APP_VERSION=$VERSION
 
-      # Installers. Archived on the build host: upload-artifact drops symlinks and exec bits.
+      # Packages. Archived on the build host: upload-artifact drops symlinks and exec bits.
       - if: matrix.target == 'linux'
         run: |
-          linux/package-deb.sh "$VERSION"
-          tar czf Pantrace-linux-x64.tar.gz -C build/linux/x64/release bundle
+          linux/package-deb.sh "$VERSION" ${{ matrix.arch }}
+          linux/package-rpm.sh "$VERSION" ${{ matrix.arch }}
+          tar czf Pantrace-linux-${{ matrix.arch }}.tar.gz -C build/linux/${{ matrix.arch }}/release bundle
       - if: matrix.target == 'windows'
         # pwsh, not bash: git-bash rewrites the leading-slash /D flag into a path.
         shell: pwsh
-        run: iscc "/DAppVersion=$env:VERSION" windows/installer.iss
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup -y --no-progress
+            $env:Path += ";${env:ProgramFiles(x86)}\Inno Setup 6;$env:ProgramFiles\Inno Setup 6"
+          }
+          iscc "/DAppVersion=$env:VERSION" "/DArch=${{ matrix.arch }}" windows/installer.iss
+          Compress-Archive -Path "build/windows/${{ matrix.arch }}/runner/Release/*" `
+            -DestinationPath "Pantrace-windows-${{ matrix.arch }}-portable.zip"
       - if: matrix.target == 'macos'
         run: |
-          mkdir dmg && cp -R build/macos/Build/Products/Release/Pantrace.app dmg/ && ln -s /Applications dmg/Applications
+          APP=build/macos/Build/Products/Release/Pantrace.app
+          lipo -archs "$APP/Contents/MacOS/Pantrace"   # expect: x86_64 arm64
+          mkdir dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
           hdiutil create -volname Pantrace -srcfolder dmg -ov -format UDZO Pantrace-macos.dmg
       - uses: actions/upload-artifact@v4
         with:
-          name: Pantrace-${{ matrix.target }}
+          name: Pantrace-${{ matrix.target }}-${{ matrix.arch }}
           path: Pantrace-*
 
   release:
@@ -104,13 +154,14 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { merge-multiple: true }
+      - run: sha256sum Pantrace-* | tee SHA256SUMS
       # Tags the bumped main, so v<tag> contains the pubspec that says <tag>.
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ needs.version.outputs.version }}
         run: |
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" && { echo "$TAG exists, skipping"; exit 0; }
-          gh release create "$TAG" Pantrace-* -R "$GITHUB_REPOSITORY" \
+          gh release create "$TAG" Pantrace-* SHA256SUMS -R "$GITHUB_REPOSITORY" \
             --target main --generate-notes
 
       # The Homebrew cask in PanterSoft/homebrew-pantersoft follows the latest

@@ -5,6 +5,7 @@
 [![CI](https://github.com/PanterSoft/Pantrace/actions/workflows/ci.yml/badge.svg)](https://github.com/PanterSoft/Pantrace/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/PanterSoft/Pantrace)](https://github.com/PanterSoft/Pantrace/releases/latest)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+![Architectures](https://img.shields.io/badge/arch-x64%20%7C%20arm64-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Open-source CAN bus tracer with DBC decoding — the 10 % of CANoe most people
@@ -24,8 +25,19 @@ back. One Flutter codebase, no native plugin code.
 - **DBC decoding** — expand a message to see its signals inline, scaled, with
   units, value tables and multiplexing resolved
 - **Filtering** — hex ids and ranges (`100, 200-2FF`), or DBC-known only
-- **Send** — raw frames, 11/29-bit, RTR
-- **Export** — CSV of the trace buffer, plus frames/s and per-channel bus load
+- **Time modes** — click the live view's TIME header for absolute, relative to
+  measurement start, or delta to the previous frame
+- **Send** — raw frames, 11/29-bit, RTR; or pick a DBC message and type
+  physical signal values (value-table names work too)
+- **Cyclic transmit** — give Send a cycle time and the frame repeats; the
+  transmit list (⟳ in the toolbar) pauses, resumes and removes them
+- **Record** — streams every frame to disk, independent of pause, filter and
+  the view's buffer, as any of the formats below. MF4 recordings are flagged
+  unfinalised until stopped, so a crash still leaves a recoverable file
+- **Log files** — open a log into the trace (offline analysis), replay one onto
+  the connected buses with its original timing (0.25×–10×, loop, channel
+  mapping), or export the trace buffer
+- **Statistics** — frames/s and per-channel bus load
 - **Share** — re-expose whatever adapter is connected as an SLCAN device, so
   python-can, SavvyCAN, cangaroo or `slcand` use it alongside Pantrace:
   `socket://127.0.0.1:20100` on every OS, plus a virtual serial port
@@ -45,8 +57,16 @@ brew install --cask pantrace
 The build is ad-hoc signed, not notarised, so macOS quarantines it. If it
 refuses to open: `xattr -dr com.apple.quarantine /Applications/Pantrace.app`.
 
-Windows, Linux and the plain macOS dmg: grab the installer from the
-[latest release](https://github.com/PanterSoft/Pantrace/releases/latest).
+Everything else is on the
+[latest release](https://github.com/PanterSoft/Pantrace/releases/latest):
+
+| OS | x64 (Intel/AMD) | arm64 |
+| --- | --- | --- |
+| Windows 10/11 | `Pantrace-windows-x64-setup.exe` or `-portable.zip` | `Pantrace-windows-arm64-setup.exe` or `-portable.zip` |
+| macOS 12+ | `Pantrace-macos.dmg` (universal) | same |
+| Debian, Ubuntu | `Pantrace-linux-amd64.deb` | `Pantrace-linux-arm64.deb` |
+| Fedora, openSUSE, RHEL | `Pantrace-linux-x86_64.rpm` | `Pantrace-linux-aarch64.rpm` |
+| Other Linux | `Pantrace-linux-x64.tar.gz` | `Pantrace-linux-arm64.tar.gz` (Raspberry Pi 4/5 with a 64-bit OS) |
 
 No hardware? Pick **Demo traffic generator**, hit Connect, then **Load DBC** →
 `example/demo.dbc`.
@@ -97,10 +117,38 @@ make run      # picks macos / linux / windows from the host; override with OS=
 make build    # release bundle into build/<os>/
 ```
 
-Linux also needs `ninja-build libgtk-3-dev`.
+Linux also needs `ninja-build libgtk-3-dev`. Packages from a Linux build:
+`linux/package-deb.sh <version> [x64|arm64]` and `linux/package-rpm.sh …`.
 
-Not here yet: CAN FD, signal-level transmit composer, disk logging beyond CSV,
-graphing.
+Not here yet: CAN FD, signal graphing.
+
+## Log formats
+
+Read and written, checked against python-can and asammdf in both directions:
+
+| Format | Extension | Written by / read by |
+| --- | --- | --- |
+| Vector BLF | `.blf` | CANoe, CANalyzer (native log), python-can |
+| Vector ASC | `.asc` | CANoe, CANalyzer, SavvyCAN, python-can |
+| ASAM MDF 4.1 | `.mf4` `.mdf` | CANape, CANoe, asammdf, CANedge — standard CAN bus-logging layout; reads DT/DZ/DL/HL data, sorted and unsorted |
+| candump | `.log` | Linux can-utils (`candump -l`, `canplayer`), python-can |
+| PCAN trace | `.trc` | PCAN-View (writes 2.1, reads 1.x and 2.x) |
+| CSV | `.csv` | spreadsheets |
+
+## CI/CD
+
+Every push and pull request runs analysis and the tests on Linux, macOS and
+Windows, then builds release packages natively on each OS and CPU:
+
+| OS | x64 | arm64 | Packages |
+| --- | --- | --- | --- |
+| Linux | `ubuntu-latest` | `ubuntu-24.04-arm` | `.deb`, `.rpm`, `.tar.gz` |
+| Windows | `windows-latest` | `windows-11-arm` (experimental) | installer, portable `.zip` |
+| macOS | universal binary on `macos-latest` | ← same | `.dmg` |
+
+A push to `main` bumps the version, tags it and publishes every package with a
+`SHA256SUMS` file. The in-app updater downloads the installer matching the
+machine's architecture.
 
 ## License
 
