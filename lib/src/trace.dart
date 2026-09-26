@@ -13,6 +13,7 @@ import 'can.dart';
 import 'dbc.dart';
 import 'log/csv.dart';
 import 'log/log.dart';
+import 'signals.dart';
 
 /// One row of the grouped ("fixed position") view: the latest state of an id.
 class TraceRow {
@@ -49,7 +50,7 @@ class TraceRow {
       (channel << 32) | DbcDatabase.key(id, extended);
 }
 
-enum TraceView { live, grouped }
+enum TraceView { live, grouped, graphics }
 
 /// How the live view shows time: wall clock, seconds since the measurement
 /// started, or the gap to the previous frame — CANoe's trace time modes.
@@ -81,6 +82,9 @@ class TraceModel extends ChangeNotifier {
 
   /// First frame since the last [clear]; the zero of [TimeMode.relative].
   DateTime? measurementStart;
+
+  /// Signals plotted in the graphics view, sampled from every traced frame.
+  final plot = SignalPlot();
 
   /// Set while frames are being logged to disk. Recording sees every frame,
   /// whatever the pause state or view filter.
@@ -204,6 +208,7 @@ class TraceModel extends ChangeNotifier {
       return;
     }
     totalFrames++;
+    plot.feed(frame, messageFor(frame.channel, frame.id, frame.extended));
 
     final key = TraceRow.rowKey(frame.channel, frame.id, frame.extended);
     final existing = _rows[key];
@@ -244,7 +249,23 @@ class TraceModel extends ChangeNotifier {
     totalFrames = 0;
     errorFrames = 0;
     measurementStart = null;
+    plot.clearData();
     notifyListeners();
+  }
+
+  /// Plots [signal] of [msg] on [channel], filled from the trace buffer so
+  /// what is already on screen shows up at once. False when it cannot be
+  /// added (all plot slots taken, or already plotted).
+  bool plotSignal(int channel, DbcMessage msg, DbcSignal signal) {
+    final s = plot.add(channel, msg, signal);
+    if (s == null) return false;
+    for (final f in _live) {
+      if (f.channel != channel || f.isError) continue;
+      final m = messageFor(f.channel, f.id, f.extended);
+      if (identical(m, msg)) SignalPlot.sample(s, msg, f);
+    }
+    notifyListeners();
+    return true;
   }
 
   void setTimeMode(TimeMode m) {
@@ -301,6 +322,8 @@ class TraceModel extends ChangeNotifier {
   }
 
   void loadDbc(int channel, DbcDatabase db, String path) {
+    // Plotted signals belong to the old database's definitions.
+    plot.removeChannel(channel);
     dbcs[channel] = db;
     dbcPaths[channel] = path;
     notifyListeners();
@@ -309,6 +332,7 @@ class TraceModel extends ChangeNotifier {
   void clearDbc(int channel) {
     dbcs[channel] = null;
     dbcPaths[channel] = null;
+    plot.removeChannel(channel);
     notifyListeners();
   }
 
@@ -409,6 +433,7 @@ class TraceModel extends ChangeNotifier {
   @override
   void dispose() {
     _repaint?.cancel();
+    plot.dispose();
     super.dispose();
   }
 }

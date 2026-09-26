@@ -29,6 +29,11 @@ back. One Flutter codebase, no native plugin code.
 - **Live view** — frame-by-frame log, newest first
 - **DBC decoding** — expand a message to see its signals inline, scaled, with
   units, value tables and multiplexing resolved
+- **Graphics** — plot up to eight DBC signals over time (CANoe's Graphics
+  window): one strip per signal with its own scale on a shared time axis, value
+  tables and flags drawn as steps, a cursor that reads every signal at the same
+  instant, and a 1–60 s or full-history window. Add signals from the picker or
+  the chart button on a signal row; logs opened offline plot too
 - **Filtering** — hex ids and ranges (`100, 200-2FF`), or DBC-known only
 - **Time modes** — click the live view's TIME header for absolute, relative to
   measurement start, or delta to the previous frame
@@ -134,7 +139,7 @@ make build    # release bundle into build/<os>/
 Linux also needs `ninja-build libgtk-3-dev`. Packages from a Linux build:
 `linux/package-deb.sh <version> [x64|arm64]` and `linux/package-rpm.sh …`.
 
-Not here yet: signal graphing.
+Not here yet: signal triggers and measurement markers in the graphics view.
 
 ## Log formats
 
