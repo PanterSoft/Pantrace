@@ -436,9 +436,12 @@ BA_ "VFrameFormat" BO_ 770 0;
       await Future<void>.delayed(const Duration(milliseconds: 600));
       expect(got.where((f) => f.fd && f.brs && f.data.length == 64), isNotEmpty);
       expect(got.where((f) => f.fd && !f.brs && f.data.length == 12), isNotEmpty);
+      // The generator keeps running, so pick the echo out of the traffic
+      // rather than assuming it arrives last.
       await bus.send(fdFrame(0x7, seq(13)));
-      final echo = got.last;
-      expect((echo.fd, echo.brs, echo.data.length, echo.direction), (true, true, 16, FrameDirection.tx));
+      await settle();
+      final echo = got.singleWhere((f) => f.id == 0x7 && f.direction == FrameDirection.tx);
+      expect((echo.fd, echo.brs, echo.data.length), (true, true, 16));
       await bus.close();
 
       final classic = VirtualBus();
