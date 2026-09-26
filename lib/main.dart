@@ -14,10 +14,12 @@ import 'src/dbc.dart';
 import 'src/log/log.dart';
 import 'src/registry.dart';
 import 'src/share.dart';
+import 'src/signals.dart';
 import 'src/trace.dart';
 import 'src/transmit.dart';
 import 'src/update.dart';
 
+part 'ui/graphics.dart';
 part 'ui/logging.dart';
 part 'ui/send.dart';
 
@@ -106,6 +108,20 @@ class _TracerPageState extends State<TracerPage> {
   bool scanning = false;
   final expanded = <int>{};
   late final tx = TxScheduler(sendFrame);
+
+  /// Seconds of history the graphics view shows; null shows everything.
+  double? plotWindow = 10;
+  void setPlotWindow(double? w) => setState(() => plotWindow = w);
+
+  /// Adds or removes a signal from the graphics view.
+  void togglePlot(int channel, DbcMessage msg, DbcSignal sig) {
+    final key = SignalKey(channel, msg.id, msg.extended, sig.name);
+    if (model.plot.contains(key)) {
+      model.plot.remove(key);
+    } else if (!model.plotSignal(channel, msg, sig)) {
+      _toast('The graphics view plots up to ${SignalPlot.maxSeries} signals');
+    }
+  }
   LogReplay? replay;
 
   @override
@@ -560,10 +576,12 @@ class _TracerPageState extends State<TracerPage> {
           const Divider(height: 1),
           Expanded(
             child: ListenableBuilder(
-              listenable: model,
-              builder: (context, _) => model.view == TraceView.grouped
-                  ? _GroupedTable(state: this)
-                  : _LiveTable(state: this),
+              listenable: Listenable.merge([model, model.plot]),
+              builder: (context, _) => switch (model.view) {
+                TraceView.grouped => _GroupedTable(state: this),
+                TraceView.live => _LiveTable(state: this),
+                TraceView.graphics => _GraphicsView(state: this),
+              },
             ),
           ),
           const Divider(height: 1),
@@ -734,6 +752,10 @@ class _Toolbar extends StatelessWidget {
                   value: TraceView.live,
                   icon: Icon(Icons.stream),
                   label: Text('Live')),
+              ButtonSegment(
+                  value: TraceView.graphics,
+                  icon: Icon(Icons.show_chart),
+                  label: Text('Graphics')),
             ],
             selected: {state.model.view},
             onSelectionChanged: (s) => state.model.setView(s.first),
@@ -1071,11 +1093,25 @@ class _GroupedTable extends StatelessWidget {
   Widget _signalRow(BuildContext context, _SigLine l) {
     final s = l.sig;
     final data = l.row.data;
+    final r = l.row;
+    final msg = state.model.messageFor(r.channel, r.id, r.extended)!;
+    final plotted = state.model.plot.contains(SignalKey(r.channel, msg.id, msg.extended, s.name));
     return Padding(
       padding: const EdgeInsets.only(left: 4, right: 12),
       child: Row(
         children: [
-          const SizedBox(width: 40),
+          SizedBox(
+            width: 40,
+            child: IconButton(
+              tooltip: plotted ? 'Remove ${s.name} from Graphics' : 'Plot ${s.name} in Graphics',
+              visualDensity: VisualDensity.compact,
+              iconSize: 16,
+              isSelected: plotted,
+              onPressed: () => state.togglePlot(r.channel, msg, s),
+              icon: const Icon(Icons.show_chart),
+              selectedIcon: const Icon(Icons.show_chart, color: Color(0xFF3DDC84)),
+            ),
+          ),
           const Expanded(flex: 3, child: SizedBox()),
           Expanded(
               flex: 4,
